@@ -2,10 +2,7 @@
 
 ## Record description (`apps/PPSA99225.json`, `description`)
 
-Unofficial experimental PS5 homebrew that runs the official Windows Jagex
-Launcher, the Old School RuneScape client and RuneLite through Wine. No Jagex
-software is bundled; this project is not affiliated with or approved by Jagex or
-Sony.
+Jagex Launcher on PS5 for Old School RuneScape, with the official client or RuneLite; press Create+Options for the menu and L3+R3 for the on-screen keyboard.
 
 ## Release notes (GitHub release description, shown by the catalog)
 
@@ -29,6 +26,6 @@ own Jagex account.
 
 Known limits: extended play sessions, complete game caches and return to the
 launcher are not qualified; DNS beyond the normal path and ICMP are not
-qualified; Java Sound and Discord are untested; HDOS and RuneScape 3 are not
+qualified; game sound works in both clients; Discord is untested; HDOS and RuneScape 3 are not
 supported yet; some inherited WoW/Battle.net menu entries remain. Not affiliated
 with or endorsed by Jagex or Sony Interactive Entertainment.

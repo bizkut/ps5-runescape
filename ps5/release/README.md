@@ -181,10 +181,11 @@ hw_accel=AUTO
   controller layout above, the on-screen keyboard and fresh-cache start-up were
   checked on a console in bounded runs. Extended play sessions, complete game
   caches and returning from the game to the launcher are **not** qualified.
-- RuneLite is an unqualified experiment.
+- RuneLite was checked on a console (game view, sidebar, pointer, clicks and
+  sound); its GPU plugin is untested.
 - Network name resolution beyond the ordinary path, and ICMP (ping) support used
-  by the client, are not qualified. Java Sound and Discord integration are
-  untested.
+  by the client, are not qualified. Game sound works in both clients; Discord
+  integration is untested.
 - **HDOS and RuneScape 3 are not supported yet.** Only the official OSRS client
   and RuneLite are targeted.
 - Some menu entries and files come from the project this one is derived from
