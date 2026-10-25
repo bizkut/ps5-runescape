@@ -108,9 +108,15 @@ JOBS=24 bash ps5/release/build-linux.sh /path/to/SOURCE_ROOT 01.000.021
 ```
 
 The version must match `ps5/title/sce_sys/param.json` and is the release tag
-(`01.000.021` is the first public RuneScape prerelease). Pushing a tag
-`NN.NNN.NNN` runs `.github/workflows/release.yml`, which fetches the pinned
-sources and runs this same build on a self-hosted Linux runner. Expect a **multi-hour cold
+(`01.000.021` is the first public RuneScape prerelease).
+`.github/workflows/release.yml` fetches the pinned sources and runs this same
+build on a self-hosted Linux runner. To release, raise `contentVersion`, commit
+and push, then open Actions → Release → Run workflow and tick **publish**: the
+version defaults to `contentVersion`, the run refuses an existing tag, and on
+success it creates the tag at the built commit and publishes the ZIP and its
+`.sha256` (a pre-release unless **prerelease** is unticked). Without
+**publish** it only builds and keeps the ZIP as a run artifact. Pushing a tag
+`NN.NNN.NNN` still builds and publishes that tag. Expect a **multi-hour cold
 build** (planning estimate: 2–4 hours; not measured for this fork). The pinned
 container builds SDK/native tools, patched RADV, whisper/ggml, FreeType, GnuTLS,
 Wine, vkd3d, DXVK, pinned PE64 Mesa WGL/Zink, both B1 roles and the archive. Host build
