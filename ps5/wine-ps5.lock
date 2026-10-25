@@ -1,0 +1,9 @@
+{
+  "repository": "../ps5-wine",
+  "branch": "runescape",
+  "commit": "6d2b35a5e41075daa56edb9fb2dfa0d0a1629f11",
+  "origin": "https://github.com/bizkut/ps5-forever-wine.git",
+  "valve_upstream": "https://github.com/ValveSoftware/wine",
+  "winehq_upstream": "https://gitlab.winehq.org/wine/wine.git",
+  "published": false
+}

@@ -1,0 +1,1535 @@
+diff --git a/src-tauri/src/catalog.rs b/src-tauri/src/catalog.rs
+index 4d97061..7732a53 100644
+--- a/src-tauri/src/catalog.rs
++++ b/src-tauri/src/catalog.rs
+@@ -9,30 +9,38 @@ pub const BUNDLED: &str = include_str!("../../catalog/forever.json");
+ pub const REMOTE_URL: &str =
+     "https://raw.githubusercontent.com/Topher121/AddonForge/main/catalog/forever.json";
+ pub const GITHUB_URL: &str =
+-    "https://raw.githubusercontent.com/layday/github-wow-addon-catalogue/main/addons.csv";
++    "https://raw.githubusercontent.com/bizkut/github-wow-addon-catalogue/main/addons.csv";
+ pub const BUNDLED_GITHUB: &str = include_str!("../../catalog/github.csv");
+ const GITHUB_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+ const MAX_INDEX_BYTES: usize = 8 * 1024 * 1024;
+ const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
++const GITHUB_CACHE_FORMAT: u32 = 2;
+ 
+ #[derive(Deserialize)]
+ struct GithubRow {
+-    id: u64,
++    id: String,
+     name: String,
+     full_name: String,
+     url: String,
+     description: String,
++    last_updated: String,
+     flavors: String,
+     curse_id: String,
+     wago_id: String,
+     wowi_id: String,
++    #[serde(default)]
++    release_tag_prefix: String,
++    #[serde(default)]
++    asset_name_pattern: String,
++    #[serde(default)]
++    folders: String,
+ }
+ 
+ fn parse_github(text: &str) -> anyhow::Result<Vec<GithubRow>> {
+     let mut reader = csv::Reader::from_reader(text.as_bytes());
+     let rows: Vec<GithubRow> = reader.deserialize().collect::<Result<_, _>>()?;
+     anyhow::ensure!(!rows.is_empty() && rows.iter().all(|r|
+-        r.id != 0 && r.full_name.split('/').all(|part| !matches!(part, "." | ".."))
++        !r.id.is_empty() && r.full_name.split('/').all(|part| !matches!(part, "." | ".."))
+             && r.url.strip_prefix("https://github.com/") == Some(r.full_name.as_str())
+             && crate::sources::parse_github_repo(&r.full_name).as_deref() == Some(&r.full_name)),
+         "Invalid GitHub add-on catalogue");
+@@ -50,12 +58,18 @@ fn github_entries(rows: &[GithubRow], flavor: crate::flavor::Flavor) -> Vec<Cata
+         github: Some(r.full_name.clone()), url: Some(r.url.clone()),
+         wowi: r.wowi_id.parse().ok(), curse: r.curse_id.parse().ok(),
+         wago: if r.wago_id.is_empty() { None } else { Some(r.wago_id.clone()) },
++        release_tag_prefix: (!r.release_tag_prefix.is_empty()).then(|| r.release_tag_prefix.clone()),
++        asset_name_pattern: (!r.asset_name_pattern.is_empty()).then(|| r.asset_name_pattern.clone()),
++        catalog_updated_at: (!r.last_updated.is_empty()).then(|| r.last_updated.clone()),
++        folders: r.folders.split(',').filter(|f| !f.is_empty()).map(str::to_string).collect(),
+         forever: Some(true), ..Default::default()
+     }).collect()
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+ struct CachedGithub {
++    format: u32,
++    source_url: String,
+     fetched_at: u64,
+     etag: Option<String>,
+     text: String,
+@@ -134,7 +148,8 @@ async fn github_index(client: &reqwest::Client, url: &str,
+                       path: &std::path::Path, refresh: bool) -> Vec<GithubRow> {
+     let cached = read_cache(path).ok()
+         .and_then(|bytes| serde_json::from_slice::<CachedGithub>(&bytes).ok())
+-        .filter(|c| parse_github(&c.text).is_ok());
++        .filter(|c| c.format == GITHUB_CACHE_FORMAT && c.source_url == url
++            && parse_github(&c.text).is_ok());
+     if !refresh && cached.as_ref().is_some_and(|c|
+         c.fetched_at <= now() && now() - c.fetched_at < GITHUB_TTL.as_secs()) {
+         return parse_github(&cached.unwrap().text).unwrap();
+@@ -147,6 +162,7 @@ async fn github_index(client: &reqwest::Client, url: &str,
+         let response = request.send().await.ok()?;
+         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+             return cached.as_ref().map(|c| CachedGithub {
++                format: GITHUB_CACHE_FORMAT, source_url: url.to_string(),
+                 fetched_at: now(), etag: c.etag.clone(), text: c.text.clone() });
+         }
+         let response = response.error_for_status().ok()?;
+@@ -154,7 +170,8 @@ async fn github_index(client: &reqwest::Client, url: &str,
+             .and_then(|h| h.to_str().ok()).map(str::to_owned);
+         let text = String::from_utf8(read_index(response).await?).ok()?;
+         parse_github(&text).ok()?;
+-        Some(CachedGithub { fetched_at: now(), etag, text })
++        Some(CachedGithub { format: GITHUB_CACHE_FORMAT, source_url: url.to_string(),
++            fetched_at: now(), etag, text })
+     }.await;
+     if let Some(record) = fetched {
+         if let Ok(bytes) = encode_cache(&record) {
+@@ -195,6 +212,15 @@ pub struct CatalogEntry {
+     /// and no release.json.
+     #[serde(default)]
+     pub asset_hint: Option<String>,
++    /// Optional GitHub release tag prefix. Install and update stay in this stream.
++    #[serde(default)]
++    pub release_tag_prefix: Option<String>,
++    /// Exact or one-wildcard GitHub release asset filename.
++    #[serde(default)]
++    pub asset_name_pattern: Option<String>,
++    /// Catalogue source's latest release timestamp.
++    #[serde(default, skip_serializing)]
++    pub catalog_updated_at: Option<String>,
+     /// Top-level AddOns folders the release installs (used to match what's
+     /// already on disk to this entry).
+     #[serde(default)]
+@@ -499,6 +525,8 @@ mod live_tests {
+     const CSV_FIXTURE: &str = "id,name,full_name,url,description,last_updated,flavors,curse_id,wago_id,wowi_id,has_release_json,last_seen\n\
+         42,Quoted,Owner/Repo,https://github.com/Owner/Repo,\"Comma, \"\"quote\"\"\nand newline\",2026-10-18,\"mainline,mists,bcc,classic,forever\",123,key,7,True,2026-10-18\n\
+         43,Other,Owner/Other,https://github.com/Owner/Other,Other,2026-10-18,wrath,,,,False,2026-10-18\n";
++    const EXTENDED_CSV_FIXTURE: &str = "id,name,full_name,url,description,last_updated,flavors,curse_id,wago_id,wowi_id,has_release_json,last_seen,release_tag_prefix,asset_name_pattern,folders\n\
++        42:quests-audio,Spoken Quests Audio (All),Owner/Repo,https://github.com/Owner/Repo,Audio,2026-10-18,forever,,,,False,2026-10-18,quests-audio/,SpokenQuestsAudioAll-2.4.0.zip,\"SpokenQuestsAudioAlliance,SpokenQuestsAudioHorde\"\n";
+ 
+     fn oversized_chunked_server(prefix: String, fill: u8, suffix: &'static str, lying_length: bool)
+         -> (String, std::thread::JoinHandle<()>) {
+@@ -535,6 +563,7 @@ mod live_tests {
+         let github_path = dir.join("github.json");
+         let json_path = dir.join("public.json");
+         let github = serde_json::to_vec(&CachedGithub {
++            format: GITHUB_CACHE_FORMAT, source_url: String::new(),
+             fetched_at: now(), etag: None, text: CSV_FIXTURE.into(),
+         }).unwrap();
+         let public = serde_json::to_vec(&CachedJson {
+@@ -546,10 +575,14 @@ mod live_tests {
+         for lying_length in [false, true] {
+             let (url, server) = oversized_chunked_server(
+                 CSV_FIXTURE.replace("42,Quoted", "99,Quoted"), b'\n', "", lying_length);
++            let mut record: CachedGithub = serde_json::from_slice(&github).unwrap();
++            record.source_url = url.clone();
++            let matching_github = serde_json::to_vec(&record).unwrap();
++            std::fs::write(&github_path, &matching_github).unwrap();
+             let rows = github_index(&client, &url, &github_path, true).await;
+             server.join().unwrap();
+-            assert_eq!(rows[0].id, 42);
+-            assert_eq!(std::fs::read(&github_path).unwrap(), github);
++            assert_eq!(rows[0].id, "42");
++            assert_eq!(std::fs::read(&github_path).unwrap(), matching_github);
+ 
+             let (url, server) = oversized_chunked_server("[{\"id\":99,\"padding\":\"".into(), b'x', "\"}]", lying_length);
+             let data = cached_json(&client, &url, &json_path, true, |v| v.is_array()).await.unwrap();
+@@ -597,6 +630,26 @@ mod live_tests {
+         assert!(parse_github(&CSV_FIXTURE.replace("Owner/Repo", "../escape")).is_err());
+     }
+ 
++    #[test]
++    fn extended_csv_selectors_and_folders_round_trip_while_old_rows_default_empty() {
++        let old = github_entries(&parse_github(CSV_FIXTURE).unwrap(), Flavor::Forever);
++        assert_eq!(old.len(), 1);
++        assert!(old[0].release_tag_prefix.is_none());
++        assert!(old[0].asset_name_pattern.is_none());
++        assert!(old[0].folders.is_empty());
++
++        let extended = github_entries(
++            &parse_github(EXTENDED_CSV_FIXTURE).unwrap(), Flavor::Forever);
++        assert_eq!(extended.len(), 1);
++        assert_eq!(extended[0].id, "gh-42:quests-audio");
++        assert_eq!(extended[0].release_tag_prefix.as_deref(), Some("quests-audio/"));
++        assert_eq!(extended[0].asset_name_pattern.as_deref(),
++            Some("SpokenQuestsAudioAll-2.4.0.zip"));
++        assert_eq!(extended[0].folders,
++            ["SpokenQuestsAudioAlliance", "SpokenQuestsAudioHorde"]);
++        assert_eq!(extended[0].catalog_updated_at.as_deref(), Some("2026-10-18"));
++    }
++
+     #[test]
+     fn cache_replacement_preserves_last_good_until_success_and_on_failure() {
+         let dir = std::env::temp_dir().join(format!("af-cache-replace-{}", std::process::id()));
+@@ -626,6 +679,43 @@ mod live_tests {
+         std::fs::remove_dir_all(dir).unwrap();
+     }
+ 
++    #[tokio::test]
++    async fn legacy_or_foreign_github_cache_refreshes_or_uses_bundled_snapshot() {
++        use std::io::{Read, Write};
++        let dir = std::env::temp_dir().join(format!("af-github-cache-source-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("index.json");
++        let legacy = serde_json::json!({
++            "fetched_at": now(), "etag": "\"old\"", "text": CSV_FIXTURE
++        });
++        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
++
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let url = format!("http://{}", listener.local_addr().unwrap());
++        let server = std::thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            let mut request = [0;4096];
++            let count = stream.read(&mut request).unwrap();
++            assert!(!String::from_utf8_lossy(&request[..count])
++                .to_lowercase().contains("if-none-match"));
++            let body = CSV_FIXTURE.replace("42,Quoted", "99,Quoted");
++            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
++                body.len()).unwrap();
++        });
++        assert_eq!(github_index(&reqwest::Client::new(), &url, &path, false).await[0].id, "99");
++        server.join().unwrap();
++
++        let foreign = serde_json::json!({
++            "format": 1, "source_url": "https://example.invalid/old.csv",
++            "fetched_at": now(), "etag": "\"foreign\"", "text": CSV_FIXTURE
++        });
++        std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
++        assert_eq!(
++            github_index(&reqwest::Client::new(), "http://127.0.0.1:1", &path, false).await.len(),
++            parse_github(BUNDLED_GITHUB).unwrap().len());
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
+     #[tokio::test]
+     async fn github_cache_uses_ttl_etag_304_stale_and_bundled_fallback() {
+         use std::io::{Read, Write};
+@@ -648,13 +738,13 @@ mod live_tests {
+         });
+         let client = reqwest::Client::new();
+         assert_eq!(github_index(&client, &url, &path, false).await.len(), 2);
+-        assert_eq!(github_index(&client, "http://127.0.0.1:1", &path, false).await.len(), 2);
++        assert_eq!(github_index(&client, &url, &path, false).await.len(), 2);
+         assert_eq!(github_index(&client, &url, &path, true).await.len(), 2);
+         server.join().unwrap();
+         let mut record: CachedGithub = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+         record.fetched_at = 1;
+         std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+-        assert_eq!(github_index(&client, "http://127.0.0.1:1", &path, false).await.len(), 2);
++        assert_eq!(github_index(&client, &url, &path, false).await.len(), 2);
+         std::fs::remove_file(&path).unwrap();
+         assert_eq!(github_index(&client, "http://127.0.0.1:1", &path, false).await.len(),
+             parse_github(BUNDLED_GITHUB).unwrap().len());
+@@ -753,7 +843,10 @@ mod live_tests {
+                 let source = entry.github.as_ref().map(|r| Source::Github(r.clone()))
+                     .or_else(|| entry.tukui.as_ref().map(|s| Source::Tukui(s.clone()))).unwrap();
+                 let remote = crate::sources::resolve(&client, &source,
+-                    ResolveOpts { flavor, asset_hint: entry.asset_hint.as_deref(), ..Default::default() })
++                    ResolveOpts { flavor, asset_hint: entry.asset_hint.as_deref(),
++                        release_tag_prefix: entry.release_tag_prefix.as_deref(),
++                        asset_name_pattern: entry.asset_name_pattern.as_deref(),
++                        ..Default::default() })
+                     .await.unwrap_or_else(|e| panic!("{} {id} resolve: {e}", flavor.id()));
+                 assert_ne!(remote.forever, Some(false), "{} {id}", flavor.id());
+                 let zip = crate::install::download(&client, &remote.download_url,
+diff --git a/src-tauri/src/install.rs b/src-tauri/src/install.rs
+index ef847c1..f39ae4a 100644
+--- a/src-tauri/src/install.rs
++++ b/src-tauri/src/install.rs
+@@ -89,6 +89,38 @@ pub fn recover_tmp(addons_dir: &Path) -> anyhow::Result<()> {
+     }
+     for entry in fs::read_dir(&temp)?.flatten() {
+         let work = entry.path();
++        if work.file_name().and_then(|name| name.to_str())
++            .is_some_and(|name| name.starts_with("trash-")) {
++            if work.join(".complete").is_file() {
++                continue;
++            }
++            let mut collision = false;
++            for entry in fs::read_dir(&work)?.flatten() {
++                let staged = entry.path();
++                let metadata = fs::symlink_metadata(&staged)?;
++                let name = staged.file_name().and_then(|name| name.to_str())
++                    .ok_or_else(|| anyhow!("invalid interrupted trash name"))?;
++                if name.is_empty() || name.starts_with('.') || name.contains("..") ||
++                    name.contains(['/', '\\']) || link_or_reparse(&metadata) ||
++                    !metadata.is_dir() {
++                    collision = true;
++                    continue;
++                }
++                let target = addons_dir.join(name);
++                if fs::symlink_metadata(&target).is_ok() {
++                    collision = true;
++                } else {
++                    fs::rename(&staged, &target)
++                        .with_context(|| format!("restore interrupted removal {name}"))?;
++                }
++            }
++            if collision {
++                fs::write(work.join(".complete"), b"complete\n")?;
++            } else {
++                remove_no_follow(&work)?;
++            }
++            continue;
++        }
+         let metadata = fs::symlink_metadata(&work)?;
+         if link_or_reparse(&metadata) || !metadata.is_dir() {
+             remove_no_follow(&work)?;
+@@ -125,7 +157,10 @@ pub fn recover_tmp(addons_dir: &Path) -> anyhow::Result<()> {
+         }
+         remove_no_follow(&work)?;
+     }
+-    remove_no_follow(&temp)
++    if fs::read_dir(&temp)?.next().is_none() {
++        fs::remove_dir(&temp)?;
++    }
++    Ok(())
+ }
+ 
+ fn tidy_operation(addons_dir: &Path, work: &Path, zip_path: &Path) {
+@@ -137,11 +172,19 @@ fn tidy_operation(addons_dir: &Path, work: &Path, zip_path: &Path) {
+     let _ = fs::remove_dir(addons_dir.join(TMP_DIR));
+ }
+ 
+-pub async fn download(
++const MAX_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
++const DOWNLOAD_WRITE_BUFFER: usize = 8 * 1024 * 1024;
++
++fn add_download_bytes(total: u64, chunk: usize) -> Option<u64> {
++    total.checked_add(chunk as u64).filter(|next| *next <= MAX_DOWNLOAD_BYTES)
++}
++
++pub async fn download_with_progress(
+     client: &reqwest::Client,
+     url: &str,
+     dest_dir: &Path,
+     filename: &str,
++    mut progress: impl FnMut(u64, Option<u64>),
+ ) -> anyhow::Result<PathBuf> {
+     fs::create_dir_all(dest_dir)?;
+     let safe: String = filename
+@@ -168,16 +211,17 @@ pub async fn download(
+             .with_context(|| format!("download failed: {url}"))?
+             .error_for_status()
+             .with_context(|| format!("download refused: {url}"))?;
+-        let mut file = fs::File::create(&path)?;
++        let length = resp.content_length();
++        let file = fs::File::create(&path)?;
++        let mut file = std::io::BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
+         let mut stream = resp.bytes_stream();
+         let mut total: u64 = 0;
+         while let Some(chunk) = stream.next().await {
+             let chunk = chunk?;
+-            total += chunk.len() as u64;
+-            if total > 512 * 1024 * 1024 {
+-                anyhow::bail!("download exceeded 512 MB; refusing");
+-            }
++            total = add_download_bytes(total, chunk.len())
++                .ok_or_else(|| anyhow::anyhow!("download exceeded 4 GiB; refusing"))?;
+             file.write_all(&chunk)?;
++            progress(total, length);
+         }
+         file.flush()?;
+         Ok::<(), anyhow::Error>(())
+@@ -191,6 +235,16 @@ pub async fn download(
+     Ok(path)
+ }
+ 
++#[cfg(test)]
++pub async fn download(
++    client: &reqwest::Client,
++    url: &str,
++    dest_dir: &Path,
++    filename: &str,
++) -> anyhow::Result<PathBuf> {
++    download_with_progress(client, url, dest_dir, filename, |_, _| {}).await
++}
++
+ fn has_toc(dir: &Path) -> bool {
+     fs::read_dir(dir)
+         .map(|rd| {
+@@ -303,6 +357,65 @@ pub fn safety_scan(root: &Path) -> anyhow::Result<usize> {
+     Ok(count)
+ }
+ 
++const EXTRACT_SINGLE_WRITE_CAP: u64 = 64 * 1024 * 1024;
++const EXTRACT_WRITE_CHUNK: usize = 4 * 1024 * 1024;
++
++fn copy_archive_entry(
++    reader: &mut impl std::io::Read,
++    writer: &mut impl std::io::Write,
++    size: u64,
++) -> std::io::Result<usize> {
++    if size <= EXTRACT_SINGLE_WRITE_CAP {
++        let mut bytes = vec![0; usize::try_from(size).unwrap_or(usize::MAX)];
++        reader.read_exact(&mut bytes)?;
++        writer.write_all(&bytes)?;
++        return Ok(1);
++    }
++    let mut buffer = vec![0; EXTRACT_WRITE_CHUNK];
++    let mut remaining = size;
++    let mut writes = 0;
++    while remaining > 0 {
++        let count = buffer.len().min(remaining as usize);
++        reader.read_exact(&mut buffer[..count])?;
++        writer.write_all(&buffer[..count])?;
++        remaining -= count as u64;
++        writes += 1;
++    }
++    Ok(writes)
++}
++
++fn extract_archive(
++    archive: &mut zip::ZipArchive<fs::File>,
++    destination: &Path,
++    progress: &mut impl FnMut(usize, usize),
++) -> anyhow::Result<()> {
++    let total = (0..archive.len())
++        .filter(|index| archive.by_index(*index).is_ok_and(|entry| !entry.is_dir()))
++        .count();
++    let mut completed = 0;
++    for index in 0..archive.len() {
++        let mut entry = archive.by_index(index)?;
++        let relative = entry.enclosed_name()
++            .ok_or_else(|| anyhow!("zip contains an unsafe path"))?
++            .to_path_buf();
++        let path = destination.join(relative);
++        if entry.is_dir() {
++            fs::create_dir_all(&path)?;
++            continue;
++        }
++        if let Some(parent) = path.parent() {
++            fs::create_dir_all(parent)?;
++        }
++        let mut output = fs::File::create(&path)?;
++        let size = entry.size();
++        copy_archive_entry(&mut entry, &mut output, size)?;
++        output.flush()?;
++        completed += 1;
++        progress(completed, total);
++    }
++    Ok(())
++}
++
+ #[derive(Clone, Debug)]
+ pub struct PlaceResult {
+     pub folders: Vec<String>,
+@@ -312,7 +425,12 @@ pub struct PlaceResult {
+ 
+ /// Extract `zip_path` and move its addon folders into `addons_dir`,
+ /// replacing same-named folders and recording the two local phases.
+-pub fn place_timed(zip_path: &Path, addons_dir: &Path, flavor: crate::flavor::Flavor) -> anyhow::Result<PlaceResult> {
++pub fn place_timed_with_progress(
++    zip_path: &Path,
++    addons_dir: &Path,
++    flavor: crate::flavor::Flavor,
++    mut progress: impl FnMut(usize, usize),
++) -> anyhow::Result<PlaceResult> {
+     fs::create_dir_all(addons_dir)?;
+     let work = addons_dir.join(TMP_DIR).join(unique());
+     let extract_dir = work.join("x");
+@@ -324,7 +442,7 @@ pub fn place_timed(zip_path: &Path, addons_dir: &Path, flavor: crate::flavor::Fl
+         let zip_started = std::time::Instant::now();
+         let file = fs::File::open(zip_path)?;
+         let mut archive = zip::ZipArchive::new(file).context("not a valid zip")?;
+-        archive.extract(&extract_dir).context("extract failed")?;
++        extract_archive(&mut archive, &extract_dir, &mut progress).context("extract failed")?;
+         let files = safety_scan(&extract_dir)?;
+         crate::logi!("zip ok: {} files, no executables", files);
+         let sources = addon_dirs(&extract_dir)?;
+@@ -385,28 +503,124 @@ pub fn place_timed(zip_path: &Path, addons_dir: &Path, flavor: crate::flavor::Fl
+     result
+ }
+ 
++#[cfg(test)]
++pub fn place_timed(
++    zip_path: &Path,
++    addons_dir: &Path,
++    flavor: crate::flavor::Flavor,
++) -> anyhow::Result<PlaceResult> {
++    place_timed_with_progress(zip_path, addons_dir, flavor, |_, _| {})
++}
++
+ #[cfg(test)]
+ /// Extract and install an addon archive.
+ pub fn place(zip_path: &Path, addons_dir: &Path) -> anyhow::Result<Vec<String>> {
+     place_timed(zip_path, addons_dir, crate::flavor::Flavor::Forever).map(|placed| placed.folders)
+ }
+ 
+-/// Delete the given addon folders (used by "Remove").
+-pub fn remove_folders(addons_dir: &Path, folders: &[String]) -> anyhow::Result<Vec<String>> {
++pub fn pending_trash(addons_dir: &Path) -> Vec<PathBuf> {
++    fs::read_dir(addons_dir.join(TMP_DIR)).into_iter().flatten().flatten()
++        .map(|entry| entry.path())
++        .filter(|path| path.file_name().and_then(|name| name.to_str())
++            .is_some_and(|name| name.starts_with("trash-")))
++        .collect()
++}
++
++fn wait_for_idle(operations: &std::sync::atomic::AtomicUsize) {
++    while operations.load(std::sync::atomic::Ordering::Acquire) != 0 {
++        std::thread::sleep(std::time::Duration::from_millis(25));
++    }
++}
++
++fn remove_idle_no_follow(
++    path: &Path,
++    operations: &std::sync::atomic::AtomicUsize,
++    slice: &mut std::time::Instant,
++) -> anyhow::Result<()> {
++    wait_for_idle(operations);
++    let metadata = match fs::symlink_metadata(path) {
++        Ok(metadata) => metadata,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++        Err(error) => return Err(error.into()),
++    };
++    if link_or_reparse(&metadata) {
++        unlink_link_or_reparse(path, &metadata)?;
++    } else if metadata.is_dir() {
++        for entry in fs::read_dir(path)?.flatten() {
++            remove_idle_no_follow(&entry.path(), operations, slice)?;
++        }
++        wait_for_idle(operations);
++        fs::remove_dir(path)?;
++    } else {
++        fs::remove_file(path)?;
++    }
++    if slice.elapsed() >= std::time::Duration::from_millis(20) {
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        *slice = std::time::Instant::now();
++    }
++    Ok(())
++}
++
++pub fn start_trash_cleanup(
++    trash: Vec<PathBuf>,
++    operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
++) -> std::thread::JoinHandle<()> {
++    std::thread::spawn(move || {
++        let mut slice = std::time::Instant::now();
++        for path in trash {
++            let parent = path.parent().map(Path::to_path_buf);
++            let _ = remove_idle_no_follow(&path, &operations, &mut slice);
++            if let Some(parent) = parent {
++                let _ = fs::remove_dir(parent);
++            }
++        }
++    })
++}
++
++pub fn stage_remove_folders(
++    addons_dir: &Path,
++    folders: &[String],
++) -> anyhow::Result<(Vec<String>, PathBuf, usize)> {
++    for folder in folders {
++        if folder.is_empty() || folder.starts_with('.') || folder.contains("..") ||
++            folder.contains(['/', '\\']) {
++            anyhow::bail!("refusing to remove suspicious folder {folder}");
++        }
++    }
++    let trash = addons_dir.join(TMP_DIR).join(format!("trash-{}", unique()));
++    fs::create_dir_all(&trash)?;
++    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+     let mut gone = Vec::new();
+-    for f in folders {
+-        if f.is_empty() || f.starts_with('.') || f.contains("..") || f.contains(['/', '\\']) {
+-            anyhow::bail!("refusing to remove suspicious folder name {f}");
++    for folder in folders {
++        debug_assert!(!folder.is_empty() && !folder.starts_with('.'));
++        let source = addons_dir.join(folder);
++        if !source.is_dir() {
++            continue;
+         }
+-        let p = addons_dir.join(f);
+-        if p.is_dir() {
+-            fs::remove_dir_all(&p).with_context(|| format!("remove {f}"))?;
+-            gone.push(f.clone());
++        let staged = trash.join(folder);
++        if let Err(error) = fs::rename(&source, &staged) {
++            for (source, staged) in moved.iter().rev() {
++                let _ = fs::rename(staged, source);
++            }
++            let _ = remove_no_follow(&trash);
++            return Err(error).with_context(|| format!("stage removal of {folder}"));
++        }
++        moved.push((source, staged));
++        gone.push(folder.clone());
++    }
++    if !gone.is_empty() {
++        if let Err(error) = fs::write(trash.join(".complete"), b"complete\n") {
++            for (source, staged) in moved.iter().rev() {
++                let _ = fs::rename(staged, source);
++            }
++            let _ = remove_no_follow(&trash);
++            return Err(error).context("complete staged removal");
+         }
+     }
+-    Ok(gone)
++    Ok((gone, trash, moved.len()))
+ }
+ 
++
+ #[cfg(test)]
+ mod tests {
+     #[test]
+@@ -511,6 +725,176 @@ mod tests {
+         let _ = fs::remove_dir_all(root);
+     }
+ 
++    #[test]
++    fn download_limit_accepts_large_audio_packs_without_overflow() {
++        let spoken_pack = 1570_u64 * 1024 * 1024;
++        assert_eq!(add_download_bytes(0, spoken_pack as usize), Some(spoken_pack));
++        assert_eq!(add_download_bytes(MAX_DOWNLOAD_BYTES - 1, 1), Some(MAX_DOWNLOAD_BYTES));
++        assert!(add_download_bytes(MAX_DOWNLOAD_BYTES, 1).is_none());
++        assert!(add_download_bytes(u64::MAX, usize::MAX).is_none());
++    }
++
++    #[test]
++    fn lore_sized_stream_is_coalesced_into_large_disk_writes() {
++        #[derive(Default)]
++        struct Writes { calls: usize, bytes: u64 }
++        impl std::io::Write for Writes {
++            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++                self.calls += 1;
++                self.bytes += bytes.len() as u64;
++                Ok(bytes.len())
++            }
++            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++        }
++        let total = 358_u64 * 1024 * 1024;
++        let chunk = vec![0; 7 * 1024];
++        let raw_calls = total.div_ceil(chunk.len() as u64);
++        let mut remaining = total;
++        let mut writer = std::io::BufWriter::with_capacity(
++            DOWNLOAD_WRITE_BUFFER, Writes::default());
++        while remaining > 0 {
++            let count = chunk.len().min(remaining as usize);
++            writer.write_all(&chunk[..count]).unwrap();
++            remaining -= count as u64;
++        }
++        writer.flush().unwrap();
++        assert_eq!(writer.get_ref().bytes, total);
++        assert!(raw_calls > 50_000);
++        assert!(writer.get_ref().calls <= 46, "writes={}", writer.get_ref().calls);
++        println!("LORE_DOWNLOAD_WRITES before={raw_calls} after={}",
++            writer.get_ref().calls);
++    }
++
++    #[test]
++    fn decompressed_entries_use_one_write_or_four_mib_chunks() {
++        struct Zeros(u64);
++        impl std::io::Read for Zeros {
++            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
++                let count = bytes.len().min(self.0 as usize);
++                bytes[..count].fill(0);
++                self.0 -= count as u64;
++                Ok(count)
++            }
++        }
++        #[derive(Default)]
++        struct Writes { calls: usize, bytes: u64 }
++        impl std::io::Write for Writes {
++            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++                self.calls += 1;
++                self.bytes += bytes.len() as u64;
++                Ok(bytes.len())
++            }
++            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++        }
++        let mut small = Writes::default();
++        copy_archive_entry(
++            &mut Zeros(8 * 1024 * 1024), &mut small, 8 * 1024 * 1024).unwrap();
++        assert_eq!((small.calls, small.bytes), (1, 8 * 1024 * 1024));
++
++        let size = 358_u64 * 1024 * 1024;
++        let mut large = Writes::default();
++        copy_archive_entry(&mut Zeros(size), &mut large, size).unwrap();
++        assert_eq!(large.bytes, size);
++        assert_eq!(large.calls, 90);
++    }
++
++    #[test]
++    fn lore_archive_io_measurement_if_requested() {
++        let Some(path) = std::env::var_os("ADDONFORGE_LORE_ZIP") else { return };
++        struct CountedFile {
++            file: fs::File,
++            reads: u64,
++            bytes: u64,
++            seeks: u64,
++        }
++        impl std::io::Read for CountedFile {
++            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
++                let count = self.file.read(bytes)?;
++                self.reads += 1;
++                self.bytes += count as u64;
++                Ok(count)
++            }
++        }
++        impl std::io::Seek for CountedFile {
++            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
++                self.seeks += 1;
++                self.file.seek(position)
++            }
++        }
++        #[derive(Default)]
++        struct Sink { writes: u64, bytes: u64 }
++        impl std::io::Write for Sink {
++            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++                self.writes += 1;
++                self.bytes += bytes.len() as u64;
++                Ok(bytes.len())
++            }
++            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++        }
++        let reader = CountedFile {
++            file: fs::File::open(path).unwrap(), reads: 0, bytes: 0, seeks: 0};
++        let mut archive = zip::ZipArchive::new(reader).unwrap();
++        let mut sink = Sink::default();
++        let mut files = 0_u64;
++        let mut decompressed = 0_u64;
++        let mut previous_writes = 0_u64;
++        for index in 0..archive.len() {
++            let mut entry = archive.by_index(index).unwrap();
++            if entry.is_dir() { continue; }
++            files += 1;
++            previous_writes += entry.size().div_ceil(8192);
++            let size = entry.size();
++            decompressed += size;
++            copy_archive_entry(&mut entry, &mut sink, size).unwrap();
++        }
++        let reader = archive.into_inner();
++        println!(
++            "LORE_EXTRACT_IO files={files} writes_before={previous_writes} writes_after={} \
++             read_calls={} read_bytes={} seeks={} pathological_bufread_bytes={}",
++            sink.writes, reader.reads, reader.bytes, reader.seeks,
++            files * DOWNLOAD_WRITE_BUFFER as u64);
++        assert_eq!(sink.bytes, decompressed);
++        assert_eq!(sink.writes, files);
++        assert!(reader.bytes < 500 * 1024 * 1024);
++    }
++
++    #[test]
++    fn lore_removal_stages_by_folder_and_crash_cleanup_preserves_reinstall() {
++        let root = std::env::temp_dir().join(format!("af-remove-trash-{}", unique()));
++        let addons = root.join("AddOns");
++        let lore = addons.join("LoreForever");
++        let voice = addons.join("LoreForever_Voice");
++        fs::create_dir_all(&lore).unwrap();
++        fs::create_dir_all(&voice).unwrap();
++        fs::write(lore.join("LoreForever.toc"), b"## Interface: 16001\n").unwrap();
++        for index in 0..5959 {
++            fs::write(lore.join(format!("voice-{index}.ogg")), b"").unwrap();
++        }
++        fs::write(voice.join("voice.ogg"), b"").unwrap();
++        let (gone, trash, renames) = stage_remove_folders(
++            &addons, &["LoreForever".into(), "LoreForever_Voice".into()]).unwrap();
++        assert_eq!(gone.len(), 2);
++        assert_eq!(renames, 2, "removal must scale with folders, not 5961 files");
++        assert!(!lore.exists() && !voice.exists());
++        assert!(trash.starts_with(addons.join(TMP_DIR)));
++        assert!(TMP_DIR.starts_with('.') && !has_toc(&addons.join(TMP_DIR)));
++
++        fs::create_dir_all(&lore).unwrap();
++        fs::write(lore.join("LoreForever.toc"), b"new install").unwrap();
++        recover_tmp(&addons).unwrap();
++        assert!(trash.exists(), "startup recovery must defer trash to idle cleanup");
++        let operations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
++        let cleanup = start_trash_cleanup(vec![trash.clone()], operations.clone());
++        std::thread::sleep(std::time::Duration::from_millis(100));
++        assert!(trash.exists(), "pending catalogue/install work must pause unlinks");
++        assert_eq!(fs::read(lore.join("LoreForever.toc")).unwrap(), b"new install");
++        operations.store(0, std::sync::atomic::Ordering::Release);
++        cleanup.join().unwrap();
++        assert_eq!(fs::read(lore.join("LoreForever.toc")).unwrap(), b"new install");
++        assert!(!addons.join(TMP_DIR).exists());
++        let _ = fs::remove_dir_all(root);
++    }
++
+     #[test]
+     fn startup_recovers_each_interrupted_replacement_step() {
+         let root = std::env::temp_dir().join(format!("af-recover-{}", unique()));
+@@ -534,11 +918,16 @@ mod tests {
+         fs::create_dir_all(temp.join("three/old/KeepNew")).unwrap();
+         fs::write(temp.join("three/old/KeepNew/old"), b"old").unwrap();
+ 
++        // A crash midway through Remove has no completion marker and rolls back.
++        fs::create_dir_all(temp.join("trash-half/HalfRemoved")).unwrap();
++        fs::write(temp.join("trash-half/HalfRemoved/original"), b"half").unwrap();
++
+         recover_tmp(&addons).unwrap();
+         assert!(addons.join("BeforeBackup/original").is_file());
+         assert!(addons.join("RestoreMe/original").is_file());
+         assert!(addons.join("KeepNew/new").is_file());
+         assert!(!addons.join("KeepNew/old").exists());
++        assert!(addons.join("HalfRemoved/original").is_file());
+         assert!(!temp.exists());
+         let _ = fs::remove_dir_all(root);
+     }
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index f6ead3d..4557c55 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -19,7 +19,7 @@ use sources::{normalize_version, ResolveOpts, Source};
+ use state::{AppState, Installed};
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
++use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+ #[cfg(feature = "gui")]
+ use tauri::State;
+ use tokio::sync::{Mutex, Notify, Semaphore};
+@@ -41,6 +41,8 @@ struct App {
+     catalog_time: Mutex<Option<std::time::Instant>>,
+     stats: Mutex<Option<Stats>>,
+     last_install_timing: Mutex<Option<InstallTiming>>,
++    progress: Arc<std::sync::Mutex<String>>,
++    operations: Arc<AtomicUsize>,
+     mutation: Mutex<()>,
+     shutdown: Notify,
+     shutting_down: AtomicBool,
+@@ -59,6 +61,27 @@ struct InstallTiming {
+     broker_write_ms: u128,
+ }
+ 
++fn set_progress(progress: &std::sync::Mutex<String>, message: String) {
++    if let Ok(mut current) = progress.lock() {
++        *current = message;
++    }
++}
++
++struct OperationGuard(Arc<AtomicUsize>);
++
++impl OperationGuard {
++    fn new(operations: Arc<AtomicUsize>) -> Self {
++        operations.fetch_add(1, Ordering::AcqRel);
++        Self(operations)
++    }
++}
++
++impl Drop for OperationGuard {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
+ fn err(e: impl std::fmt::Display) -> String {
+     e.to_string()
+ }
+@@ -461,13 +484,16 @@ async fn icon_cached(
+     v
+ }
+ 
+-fn entry_hint(cat: &Catalog, pkg: &Package) -> (Option<String>, Option<bool>) {
++fn entry_hint(cat: &Catalog, pkg: &Package)
++    -> (Option<String>, Option<String>, Option<String>, Option<bool>) {
+     let entry = pkg
+         .catalog_id
+         .as_ref()
+         .and_then(|id| cat.addons.iter().find(|e| &e.id == id));
+     (
+         entry.and_then(|e| e.asset_hint.clone()),
++        entry.and_then(|e| e.release_tag_prefix.clone()),
++        entry.and_then(|e| e.asset_name_pattern.clone()),
+         entry.and_then(|e| e.forever),
+     )
+ }
+@@ -480,13 +506,15 @@ async fn resolve_into(app: &App, pkg: &mut Package, cat: &Catalog) {
+     if matches!(src, Source::Wago(_)) && !st.has_wago_key() {
+         return;
+     }
+-    let (hint, _) = entry_hint(cat, pkg);
++    let (hint, tag_prefix, asset_pattern, _) = entry_hint(cat, pkg);
+     let flavor = match current_flavor(app).await {
+         Ok(flavor) => flavor,
+         Err(error) => { pkg.status = "error".into(); pkg.note = error; return; }
+     };
+     let opts = ResolveOpts {
+         asset_hint: hint.as_deref(),
++        release_tag_prefix: tag_prefix.as_deref(),
++        asset_name_pattern: asset_pattern.as_deref(),
+         wago_key: st.wago_key.as_deref(),
+         prerelease: st.allow_prerelease,
+         flavor,
+@@ -845,14 +873,19 @@ async fn install_from(
+     key: &str,
+     src: &Source,
+     asset_hint: Option<&str>,
++    release_tag_prefix: Option<&str>,
++    asset_name_pattern: Option<&str>,
+     _allow_non_forever: bool,
+ ) -> Result<Installed, String> {
++    set_progress(&app.progress, "Resolving add-on...".into());
+     let install = current_install(app).await?;
+     let flavor = current_flavor(app).await?;
+     let addons = addons_dir(&install);
+     let st = app.state.lock().await.clone();
+     let opts = ResolveOpts {
+         asset_hint,
++        release_tag_prefix,
++        asset_name_pattern,
+         wago_key: st.wago_key.as_deref(),
+         prerelease: st.allow_prerelease,
+         flavor,
+@@ -873,7 +906,17 @@ async fn install_from(
+     );
+     let tmp = addons.join(install::TMP_DIR).join("dl");
+     let download_started = std::time::Instant::now();
+-    let zip = install::download(&app.client, &remote.download_url, &tmp, &remote.filename)
++    let progress = app.progress.clone();
++    let zip = install::download_with_progress(
++        &app.client, &remote.download_url, &tmp, &remote.filename,
++        move |total, length| {
++            let message = if let Some(length) = length.filter(|length| *length > 0) {
++                format!("Downloading add-on... {}%", total.saturating_mul(100) / length)
++            } else {
++                format!("Downloading add-on... {} MiB", total / (1024 * 1024))
++            };
++            set_progress(&progress, message);
++        })
+         .await
+         .map_err(|e| {
+             loge!("download {key}: {e}");
+@@ -881,7 +924,11 @@ async fn install_from(
+         })?;
+     let download_ms = download_started.elapsed().as_millis();
+     let addons2 = addons.clone();
+-    let placed = tokio::task::spawn_blocking(move || install::place_timed(&zip, &addons2, flavor))
++    let progress = app.progress.clone();
++    let placed = tokio::task::spawn_blocking(move ||
++        install::place_timed_with_progress(&zip, &addons2, flavor, move |done, total| {
++            set_progress(&progress, format!("Unpacking add-on... {done}/{total} files"));
++        }))
+         .await
+         .map_err(err)?
+         .map_err(|e| {
+@@ -925,12 +972,14 @@ async fn update_package_impl(
+         .clone()
+         .ok_or_else(|| "This addon has no update source".to_string())?;
+     let cat = catalog_cached(app).await;
+-    let (hint, _) = entry_hint(&cat, &pkg);
++    let (hint, tag_prefix, asset_pattern, _) = entry_hint(&cat, &pkg);
+     install_from(
+         app,
+         &key,
+         &src,
+         hint.as_deref(),
++        tag_prefix.as_deref(),
++        asset_pattern.as_deref(),
+         allow_non_forever.unwrap_or(false),
+     )
+     .await?;
+@@ -983,7 +1032,8 @@ async fn catalog_list_impl(app: &App, refresh: Option<bool>) -> Result<Vec<Catal
+                 installed: installed_keys.contains(&key),
+                 key,
+                 downloads: st.and_then(|s| s.downloads),
+-                updated_at: st.and_then(|s| s.updated_at.clone()),
++                updated_at: st.and_then(|s| s.updated_at.clone())
++                    .or_else(|| e.catalog_updated_at.clone()),
+                 stat_source: st.map(|s| s.source.clone()).filter(|s| !s.is_empty()),
+                 entry: e,
+             }
+@@ -1184,6 +1234,8 @@ async fn install_catalog_impl(
+         &key,
+         &src,
+         e.asset_hint.as_deref(),
++        e.release_tag_prefix.as_deref(),
++        e.asset_name_pattern.as_deref(),
+         allow_non_forever.unwrap_or(false),
+     )
+     .await?;
+@@ -1215,6 +1267,8 @@ async fn install_source(
+         &key,
+         &source,
+         None,
++        None,
++        None,
+         allow_non_forever.unwrap_or(false),
+     )
+     .await?;
+@@ -1244,7 +1298,8 @@ async fn install_github(
+         .map(|e| format!("cat:{}", e.id))
+         .unwrap_or_else(|| format!("github:{repo}"));
+     let src = Source::Github(repo);
+-    install_from(&app, &key, &src, None, allow_non_forever.unwrap_or(false)).await?;
++    install_from(&app, &key, &src, None, None, None,
++        allow_non_forever.unwrap_or(false)).await?;
+     refreshed(&app, &key).await
+ }
+ 
+@@ -1256,10 +1311,14 @@ async fn remove_package_impl(app: &App, key: String) -> Result<Vec<String>, Stri
+         .find(|p| p.key == key)
+         .ok_or_else(|| "Addon not found".to_string())?;
+     let addons = addons_dir(&install);
+-    let gone = tokio::task::spawn_blocking(move || install::remove_folders(&addons, &pkg.folders))
++    let (gone, trash, _) = tokio::task::spawn_blocking(
++        move || install::stage_remove_folders(&addons, &pkg.folders))
+         .await
+         .map_err(err)?
+         .map_err(err)?;
++    if !gone.is_empty() {
++        install::start_trash_cleanup(vec![trash], app.operations.clone());
++    }
+     let mut st = app.state.lock().await;
+     st.installed.remove(&key);
+     st.pinned.remove(&key);
+@@ -1578,30 +1637,42 @@ fn make_app() -> Shared {
+         .build()
+         .expect("http client");
+     let st = AppState::load();
+-    for found in wow::find_installs() {
+-        if let Err(error) = install::recover_tmp(&addons_dir(&found.path)) {
+-            loge!("recover {}: {error}", found.path);
++    let mut install_paths: Vec<String> =
++        wow::find_installs().into_iter().map(|install| install.path).collect();
++    if let Some(path) = &st.install_path {
++        if !install_paths.iter().any(|existing| existing == path) {
++            install_paths.push(path.clone());
+         }
+     }
+-    if let Some(p) = &st.install_path {
+-        if let Err(error) = install::recover_tmp(&addons_dir(p)) {
+-            loge!("recover {p}: {error}");
++    let mut trash = Vec::new();
++    for path in &install_paths {
++        let addons = addons_dir(path);
++        if let Err(error) = install::recover_tmp(&addons) {
++            loge!("recover {path}: {error}");
+         }
++        trash.extend(install::pending_trash(&addons));
+     }
+-    Arc::new(App {
++    let operations = Arc::new(AtomicUsize::new(0));
++    let app = Arc::new(App {
+         client,
+         state: Mutex::new(st),
+         wago_valid: Mutex::new(None),
+         catalog: Mutex::new(None),
+         catalog_time: Mutex::new(None),
+         stats: Mutex::new(None),
++        progress: Arc::new(std::sync::Mutex::new(String::new())),
++        operations: operations.clone(),
+         last_install_timing: Mutex::new(None),
+         mutation: Mutex::new(()),
+         shutdown: Notify::new(),
+         shutting_down: AtomicBool::new(false),
+         #[cfg(feature = "gui")]
+         icon_cache: Mutex::new(HashMap::new()),
+-    })
++    });
++    if !trash.is_empty() {
++        install::start_trash_cleanup(trash, operations);
++    }
++    app
+ }
+ 
+ #[derive(Deserialize)]
+@@ -1667,6 +1738,11 @@ async fn catalog_view(app: &App, rows: Value, unavailable_notice: &str) -> Resul
+ }
+ 
+ async fn dispatch_headless(app: Shared, request: HeadlessRequest) -> Result<Value, String> {
++    if request.command == "operation_progress" {
++        let message = app.progress.lock().map(|value| value.clone()).unwrap_or_default();
++        return Ok(serde_json::json!({"message": message}));
++    }
++    let _pending = OperationGuard::new(app.operations.clone());
+     let _operation = app.mutation.lock().await;
+     if app.shutting_down.load(Ordering::Acquire) {
+         return Err("add-on service is shutting down".into());
+@@ -1722,7 +1798,8 @@ async fn dispatch_headless(app: Shared, request: HeadlessRequest) -> Result<Valu
+                 .map(|entry| format!("cat:{}", entry.id))
+                 .unwrap_or_else(|| format!("github:{repo}"));
+             let source = Source::Github(repo);
+-            install_from(&app, &key, &source, None, allow.unwrap_or(false)).await?;
++            install_from(&app, &key, &source, None, None, None,
++                allow.unwrap_or(false)).await?;
+             serde_json::to_value(refreshed(&app, &key).await?).map_err(err)
+         }
+         "install_bundle" => {
+@@ -2184,6 +2261,8 @@ pub fn cli(args: &[String]) -> i32 {
+                                 s,
+                                 ResolveOpts {
+                                     asset_hint: e.asset_hint.as_deref(),
++                                    release_tag_prefix: e.release_tag_prefix.as_deref(),
++                                    asset_name_pattern: e.asset_name_pattern.as_deref(),
+                                     wago_key: st.wago_key.as_deref(),
+                                     prerelease: st.allow_prerelease,
+                                     flavor,
+@@ -2218,9 +2297,10 @@ pub fn cli(args: &[String]) -> i32 {
+                 let pkg = pkgs.into_iter().find(|p| &p.key == key).ok_or("no such package")?;
+                 let src = pkg.source.clone().ok_or("package has no source")?;
+                 let cat = catalog_cached(&app).await;
+-                let (hint, _) = entry_hint(&cat, &pkg);
++                let (hint, tag_prefix, asset_pattern, _) = entry_hint(&cat, &pkg);
+                 let force = args.iter().any(|a| a == "--force");
+-                let rec = install_from(&app, key, &src, hint.as_deref(), force).await?;
++                let rec = install_from(&app, key, &src, hint.as_deref(),
++                    tag_prefix.as_deref(), asset_pattern.as_deref(), force).await?;
+                 Ok(serde_json::to_value(rec).unwrap())
+             }
+             "install" => {
+@@ -2230,21 +2310,28 @@ pub fn cli(args: &[String]) -> i32 {
+                 let has_wago = app.state.lock().await.has_wago_key();
+                 let src = pick_source(Some(&e), &AddonFolder::default(), has_wago, None).ok_or("no source")?;
+                 let force = args.iter().any(|a| a == "--force");
+-                let rec = install_from(&app, &format!("cat:{}", e.id), &src, e.asset_hint.as_deref(), force).await?;
++                let rec = install_from(&app, &format!("cat:{}", e.id), &src,
++                    e.asset_hint.as_deref(), e.release_tag_prefix.as_deref(),
++                    e.asset_name_pattern.as_deref(), force).await?;
+                 Ok(serde_json::to_value(rec).unwrap())
+             }
+             "github" => {
+                 let repo = args.get(1).and_then(|r| sources::parse_github_repo(r)).ok_or("usage: github <owner/repo>")?;
+                 let force = args.iter().any(|a| a == "--force");
+                 let key = format!("github:{repo}");
+-                let rec = install_from(&app, &key, &Source::Github(repo), None, force).await?;
++                let rec = install_from(&app, &key, &Source::Github(repo),
++                    None, None, None, force).await?;
+                 Ok(serde_json::to_value(rec).unwrap())
+             }
+             "remove" => {
+                 let key = args.get(1).ok_or("usage: remove <package key>")?;
+                 let install = current_install(&app).await?;
+                 let pkg = scan_packages(&app).await?.into_iter().find(|p| &p.key == key).ok_or("no such package")?;
+-                let gone = install::remove_folders(&addons_dir(&install), &pkg.folders).map_err(err)?;
++                let (gone, trash, _) =
++                    install::stage_remove_folders(&addons_dir(&install), &pkg.folders).map_err(err)?;
++                if !gone.is_empty() {
++                    install::start_trash_cleanup(vec![trash], app.operations.clone());
++                }
+                 let mut st = app.state.lock().await;
+                 st.installed.remove(key);
+                 st.pinned.remove(key);
+@@ -2533,7 +2620,8 @@ mod tests {
+         assert_eq!(set_install_path_impl(&app, unknown.to_string_lossy().into()).await.unwrap_err(), flavor::UNSUPPORTED);
+         // Even a persisted unsupported selection cannot reach source resolution.
+         app.state.lock().await.select_install(unknown.to_string_lossy().into());
+-        assert_eq!(install_from(&app, "github:x/y", &Source::Github("x/y".into()), None, true).await.unwrap_err(), flavor::UNSUPPORTED);
++        assert_eq!(install_from(&app, "github:x/y", &Source::Github("x/y".into()),
++            None, None, None, true).await.unwrap_err(), flavor::UNSUPPORTED);
+         assert!(!unknown.join("Interface").exists());
+         std::fs::remove_dir_all(root).unwrap();
+         std::env::remove_var("ADDONFORGE_STATE_DIR");
+@@ -2687,6 +2775,29 @@ mod tests {
+         assert!(pkgs[0].managed);
+     }
+ 
++    #[test]
++    fn hand_installed_folders_select_distinct_rows_from_the_same_repository() {
++        let st = AppState::default();
++        let cat: Catalog = serde_json::from_str(r#"{"addons":[
++            {"id":"spoken","name":"Spoken","github":"rusty-key/spoken-wow","folders":["Spoken"]},
++            {"id":"spoken-all","name":"Spoken Quests Audio (All)",
++             "github":"rusty-key/spoken-wow","folders":["SpokenQuestsAudioAlliance"]},
++            {"id":"spoken-pt","name":"Spoken Quests Audio (Portuguese)",
++             "github":"rusty-key/spoken-wow","folders":["SpokenQuestsAudio_ptBR"]},
++            {"id":"polestar","name":"Polestar","github":"fitzforge/polestar","folders":["Polestar"]}
++        ]}"#).unwrap();
++        let packages = build_packages(&st, &cat, &[
++            folder("Spoken", &[], None),
++            folder("SpokenQuestsAudioAlliance", &[], None),
++            folder("SpokenQuestsAudio_ptBR", &[], None),
++            folder("Polestar", &[], None),
++        ]);
++        let ids: std::collections::BTreeSet<_> = packages.iter()
++            .filter_map(|package| package.catalog_id.as_deref()).collect();
++        assert_eq!(ids, ["polestar", "spoken", "spoken-all", "spoken-pt"].into_iter().collect());
++        assert!(packages.iter().all(|package| package.status != "no-source"));
++    }
++
+     #[test]
+     fn missing_dependencies_are_reported_and_matched_to_catalogue() {
+         let st = AppState::default();
+@@ -2842,6 +2953,21 @@ mod tests {
+         assert!(checked_request_total(usize::MAX, 0).is_err());
+     }
+ 
++    #[test]
++    fn progress_can_be_polled_while_the_mutation_lock_is_held() {
++        let runtime = tokio::runtime::Runtime::new().unwrap();
++        runtime.block_on(async {
++            let _environment = STATE_ENV.lock().await;
++            let app = make_app();
++            set_progress(&app.progress, "Downloading add-on... 37%".into());
++            let _mutation = app.mutation.lock().await;
++            let result = dispatch_headless(app.clone(), HeadlessRequest {
++                command: "operation_progress".into(), args: Value::Null,
++            }).await.unwrap();
++            assert_eq!(result["message"], "Downloading add-on... 37%");
++        });
++    }
++
+     #[test]
+     fn shutdown_waits_for_the_active_mutation_boundary() {
+         let runtime = tokio::runtime::Runtime::new().unwrap();
+diff --git a/src-tauri/src/sources/github.rs b/src-tauri/src/sources/github.rs
+--- a/src-tauri/src/sources/github.rs
++++ b/src-tauri/src/sources/github.rs
+@@ -37,7 +37,7 @@
+     interface: u32,
+ }
+ 
+-#[derive(Deserialize, Debug)]
++#[derive(Deserialize, Debug, Clone)]
+ struct ApiRelease {
+     #[serde(default)]
+     tag_name: String,
+@@ -49,7 +49,7 @@
+     assets: Vec<ApiAsset>,
+ }
+ 
+-#[derive(Deserialize, Debug)]
++#[derive(Deserialize, Debug, Clone)]
+ struct ApiAsset {
+     name: String,
+     browser_download_url: String,
+@@ -100,13 +100,48 @@
+         } else { None })
+ }
+ 
++fn asset_pattern_matches(pattern: &str, name: &str) -> bool {
++    let pattern = pattern.to_ascii_lowercase();
++    let name = name.to_ascii_lowercase();
++    let mut parts = pattern.split('*');
++    let first = parts.next().unwrap_or("");
++    let second = parts.next();
++    if parts.next().is_some() {
++        return false;
++    }
++    match second {
++        None => name == first,
++        Some(suffix) => name.len() >= first.len() + suffix.len()
++            && name.starts_with(first) && name.ends_with(suffix),
++    }
++}
++
++fn pick_pattern_asset<'a>(
++    zips: &[&'a ApiAsset], pattern: &str,
++) -> anyhow::Result<&'a ApiAsset> {
++    let matches: Vec<_> = zips.iter().copied()
++        .filter(|asset| asset_pattern_matches(pattern, &asset.name)).collect();
++    anyhow::ensure!(matches.len() == 1,
++        "asset pattern {pattern:?} matched {} zip assets", matches.len());
++    Ok(matches[0])
++}
++
++fn pick_release<'a>(
++    releases: &'a [ApiRelease], tag_prefix: Option<&str>, prerelease: bool,
++) -> Option<&'a ApiRelease> {
++    releases.iter().find(|release| !release.draft && !release.assets.is_empty()
++        && (prerelease || !release.prerelease)
++        && tag_prefix.is_none_or(|prefix| release.tag_name.starts_with(prefix)))
++}
++
+ async fn from_api_release(
+     client: &reqwest::Client,
+     rel: ApiRelease,
+     asset_hint: Option<&str>,
++    asset_name_pattern: Option<&str>,
+     flavor: crate::flavor::Flavor,
+ ) -> anyhow::Result<Remote> {
+-    // Prefer the packager's release.json if this release has one.
++    if asset_name_pattern.is_none() {
+     if let Some(rj_asset) = rel.assets.iter().find(|a| a.name == "release.json") {
+         if let Ok(resp) = client.get(&rj_asset.browser_download_url).send().await {
+             if resp.status().is_success() {
+@@ -127,6 +162,7 @@
+             }
+         }
+     }
++    }
+     let zips: Vec<&ApiAsset> = rel
+         .assets
+         .iter()
+@@ -135,8 +171,12 @@
+     if zips.is_empty() {
+         anyhow::bail!("release {} has no zip asset", rel.tag_name);
+     }
+-    let pick = pick_asset(&zips, asset_hint, flavor)
+-        .ok_or_else(|| anyhow::anyhow!("No {} release asset", flavor.id()))?;
++    let pick = if let Some(pattern) = asset_name_pattern {
++        pick_pattern_asset(&zips, pattern)?
++    } else {
++        pick_asset(&zips, asset_hint, flavor)
++            .ok_or_else(|| anyhow::anyhow!("No {} release asset", flavor.id()))?
++    };
+     Ok(Remote {
+         version: rel.tag_name.clone(),
+         download_url: pick.browser_download_url.clone(),
+@@ -154,39 +194,60 @@
+     }
+ }
+ 
++// Bound work even if a server keeps returning full pages; REST permits 100 per page.
++const MAX_RELEASE_PAGES: usize = 1_000;
++
++async fn stream_release(
++    client: &reqwest::Client, api: &str, tag_prefix: Option<&str>, prerelease: bool,
++) -> anyhow::Result<ApiRelease> {
++    for page in 1..=MAX_RELEASE_PAGES {
++        let resp = client.get(format!("{api}?per_page=100&page={page}"))
++            .header("Accept", "application/vnd.github+json")
++            .send().await.map_err(|e| anyhow::anyhow!("GitHub API page {page}: {e}"))?;
++        let status = resp.status();
++        if status.as_u16() == 403 || status.as_u16() == 429 {
++            anyhow::bail!("GitHub API rate limit hit on page {page}; try again in an hour");
++        }
++        let list: Vec<ApiRelease> = resp.error_for_status()
++            .map_err(|e| anyhow::anyhow!("GitHub API page {page}: {e}"))?
++            .json().await.map_err(|e| anyhow::anyhow!("GitHub API page {page}: {e}"))?;
++        let exhausted = list.len() < 100;
++        if let Some(release) = pick_release(&list, tag_prefix, prerelease) {
++            return Ok(release.clone());
++        }
++        // Non-stream prerelease resolution retains its existing single-page behavior.
++        if exhausted || tag_prefix.is_none() {
++            anyhow::bail!("no GitHub release in tag stream {}", tag_prefix.unwrap_or("latest"));
++        }
++    }
++    anyhow::bail!("GitHub API pagination limit ({MAX_RELEASE_PAGES} pages) reached for tag stream {}",
++        tag_prefix.unwrap_or("latest"))
++}
++
+ pub async fn resolve(
+     client: &reqwest::Client,
+     repo: &str,
+     asset_hint: Option<&str>,
++    release_tag_prefix: Option<&str>,
++    asset_name_pattern: Option<&str>,
+     prerelease: bool,
+     flavor: crate::flavor::Flavor,
+ ) -> anyhow::Result<Remote> {
+     let repo = repo.trim().trim_matches('/');
+ 
+-    if prerelease {
+-        // Newest release including pre-releases (one API call).
+-        let api = format!("https://api.github.com/repos/{repo}/releases?per_page=5");
+-        let resp = client
+-            .get(&api)
+-            .header("Accept", "application/vnd.github+json")
+-            .send()
+-            .await?;
+-        if let Some(e) = api_error(resp.status().as_u16(), repo) {
+-            return Err(e);
+-        }
+-        let list: Vec<ApiRelease> = resp.error_for_status()?.json().await?;
+-        let rel = list
+-            .into_iter()
+-            .find(|r| !r.draft && !r.assets.is_empty())
+-            .ok_or_else(|| anyhow::anyhow!("no GitHub release with files for {repo}"))?;
+-        return from_api_release(client, rel, asset_hint, flavor).await;
+-    }
+-
+-    let base = format!("https://github.com/{repo}/releases/latest/download/");
+-    let resp = client.get(format!("{base}release.json")).send().await?;
+-    if resp.status().is_success() {
+-        let rj: ReleaseJson = resp.json().await?;
+-        return pick_from_release_json(rj, |name| format!("{base}{name}"), false, flavor);
++    if prerelease || release_tag_prefix.is_some() {
++        let api = format!("https://api.github.com/repos/{repo}/releases");
++        let rel = stream_release(client, &api, release_tag_prefix, prerelease).await?;
++        return from_api_release(client, rel, asset_hint, asset_name_pattern, flavor).await;
++    }
++
++    if asset_name_pattern.is_none() {
++        let base = format!("https://github.com/{repo}/releases/latest/download/");
++        let resp = client.get(format!("{base}release.json")).send().await?;
++        if resp.status().is_success() {
++            let rj: ReleaseJson = resp.json().await?;
++            return pick_from_release_json(rj, |name| format!("{base}{name}"), false, flavor);
++        }
+     }
+ 
+     // No release.json: ask the API for the latest release's assets.
+@@ -200,7 +261,7 @@
+         return Err(e);
+     }
+     let rel: ApiRelease = resp.error_for_status()?.json().await?;
+-    from_api_release(client, rel, asset_hint, flavor).await
++    from_api_release(client, rel, asset_hint, asset_name_pattern, flavor).await
+ }
+ 
+ #[cfg(test)]
+@@ -242,4 +303,150 @@
+         ]})).unwrap();
+         assert!(pick_from_release_json(only_wrong, str::to_string, false, Flavor::Retail).is_err());
+     }
+-}
++    #[test]
++    fn exact_or_single_wildcard_asset_patterns_are_anchored_and_unambiguous() {
++        assert!(asset_pattern_matches("LoreForever.zip", "LoreForever.zip"));
++        assert!(!asset_pattern_matches("LoreForever.zip", "LoreForever_Voice.zip"));
++        assert!(asset_pattern_matches("Spoken-*.zip", "Spoken-3.5.1.zip"));
++        assert!(!asset_pattern_matches("Spoken-*.zip", "xSpoken-3.5.1.zip"));
++        assert!(!asset_pattern_matches("a*b*c.zip", "abc.zip"));
++        let one = ApiAsset { name: "Spoken-3.zip".into(), browser_download_url: "one".into() };
++        let other = ApiAsset { name: "Spoken-4.zip".into(), browser_download_url: "other".into() };
++        assert_eq!(pick_pattern_asset(&[&one], "Spoken-*.zip").unwrap().name, one.name);
++        assert!(pick_pattern_asset(&[&one, &other], "Spoken-*.zip").is_err());
++    }
++
++    #[test]
++    fn release_prefix_never_crosses_tag_streams() {
++        let asset = || ApiAsset { name: "Addon.zip".into(), browser_download_url: "url".into() };
++        let releases = vec![
++            ApiRelease { tag_name: "manager/v9".into(), prerelease: false, draft: false,
++                assets: vec![asset()] },
++            ApiRelease { tag_name: "quests-audio/v2".into(), prerelease: true, draft: false,
++                assets: vec![asset()] },
++            ApiRelease { tag_name: "quests-audio/v1".into(), prerelease: false, draft: false,
++                assets: vec![asset()] },
++        ];
++        assert_eq!(pick_release(&releases, Some("quests-audio/"), false).unwrap().tag_name,
++            "quests-audio/v1");
++        assert_eq!(pick_release(&releases, Some("quests-audio/"), true).unwrap().tag_name,
++            "quests-audio/v2");
++        assert!(pick_release(&releases, Some("spoken/"), true).is_none());
++    }
++
++    fn release_page(tag: &str, count: usize) -> String {
++        serde_json::to_string(&vec![serde_json::json!({
++            "tag_name": tag, "draft": false, "prerelease": false,
++            "assets": [{"name":"Addon.zip", "browser_download_url":"https://example.org/Addon.zip"}]
++        }); count]).unwrap()
++    }
++
++    async fn serve_pages(pages: Vec<(u16, String)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
++        use std::io::{Read, Write};
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let url = format!("http://{}/releases", listener.local_addr().unwrap());
++        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
++        let seen = requests.clone();
++        std::thread::spawn(move || {
++            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
++            let mut pages = pages.into_iter();
++            while std::time::Instant::now() < deadline {
++                match listener.accept() {
++                    Ok((mut socket, _)) => {
++                        socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
++                        let mut bytes = Vec::new();
++                        let mut byte = [0];
++                        while !bytes.ends_with(b"\r\n\r\n") {
++                            if socket.read(&mut byte).unwrap_or(0) == 0 { break; }
++                            bytes.push(byte[0]);
++                        }
++                        seen.lock().unwrap().push(String::from_utf8(bytes).unwrap().lines().next().unwrap().to_string());
++                        let (status, body) = pages.next().unwrap_or((500, "unexpected page".into()));
++                        write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
++                    }
++                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(1)),
++                    Err(_) => break,
++                }
++            }
++        });
++        (url, requests)
++    }
++
++    #[tokio::test]
++    async fn pagination_finds_stream_on_page_two() {
++        let (api, requests) = serve_pages(vec![(200, release_page("manager/v9", 100)),
++            (200, release_page("places/v2", 1))]).await;
++        let rel = stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap();
++        assert_eq!(rel.tag_name, "places/v2");
++        assert_eq!(*requests.lock().unwrap(), [
++            "GET /releases?per_page=100&page=1 HTTP/1.1",
++            "GET /releases?per_page=100&page=2 HTTP/1.1"]);
++    }
++
++    #[tokio::test]
++    async fn pagination_stops_on_first_match() {
++        let (api, requests) = serve_pages(vec![(200, release_page("places/v1", 100))]).await;
++        assert_eq!(stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap().tag_name, "places/v1");
++        assert_eq!(requests.lock().unwrap().len(), 1);
++    }
++
++    #[tokio::test]
++    async fn pagination_exhaustion_and_api_failures_are_distinct() {
++        for tail in [release_page("manager/v1", 1), "[]".into()] {
++            let (api, requests) = serve_pages(vec![(200, release_page("manager/v2", 100)), (200, tail)]).await;
++            let error = stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap_err().to_string();
++            assert!(error.contains("no GitHub release in tag stream places/"), "{error}");
++            assert_eq!(requests.lock().unwrap().len(), 2);
++        }
++        for status in [403, 404, 429, 500] {
++            let (api, requests) = serve_pages(vec![(200, release_page("manager/v2", 100)), (status, "{}".into())]).await;
++            let error = stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap_err().to_string();
++            assert!(error.contains("GitHub API"), "{error}");
++            assert!(!error.contains("no GitHub release in tag stream"), "{error}");
++            assert_eq!(requests.lock().unwrap().len(), 2);
++        }
++    }
++
++    #[tokio::test]
++    async fn pagination_is_bounded() {
++        let (api, requests) = serve_pages(vec![(200, release_page("manager/v2", 100)); MAX_RELEASE_PAGES]).await;
++        let error = stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap_err().to_string();
++        assert!(error.contains("pagination limit"), "{error}");
++        assert_eq!(requests.lock().unwrap().len(), MAX_RELEASE_PAGES);
++    }
++
++    #[tokio::test]
++    async fn pagination_preserves_eligibility_and_asset_selection() {
++        let mut page: Vec<serde_json::Value> = serde_json::from_str(&release_page("places/v3", 100)).unwrap();
++        for release in &mut page { release["draft"] = true.into(); }
++        page[0]["draft"] = false.into();
++        page[0]["prerelease"] = true.into();
++        page[1]["draft"] = false.into();
++        page[1]["assets"] = serde_json::json!([]);
++        let (api, requests) = serve_pages(vec![(200, serde_json::to_string(&page).unwrap()),
++            (200, release_page("places/v1", 1))]).await;
++        let client = reqwest::Client::new();
++        let rel = stream_release(&client, &api, Some("places/"), false).await.unwrap();
++        let remote = from_api_release(&client, rel, None, Some("Addon.zip"), Flavor::Retail).await.unwrap();
++        assert_eq!(remote.version, "places/v1");
++        assert_eq!(remote.filename, "Addon.zip");
++        assert_eq!(requests.lock().unwrap().len(), 2);
++        let (api, requests) = serve_pages(vec![(200, serde_json::to_string(&page).unwrap())]).await;
++        assert!(stream_release(&client, &api, Some("places/"), true).await.unwrap().prerelease);
++        assert_eq!(requests.lock().unwrap().len(), 1);
++        let (api, requests) = serve_pages(vec![(200, release_page("manager/v1", 100))]).await;
++        assert_eq!(stream_release(&client, &api, None, true).await.unwrap().tag_name, "manager/v1");
++        assert_eq!(requests.lock().unwrap().len(), 1);
++    }
++
++    #[tokio::test]
++    async fn pagination_reports_transport_failure() {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let api = format!("http://{}/releases", listener.local_addr().unwrap());
++        drop(listener);
++        let error = stream_release(&reqwest::Client::new(), &api, Some("places/"), false).await.unwrap_err().to_string();
++        assert!(error.contains("GitHub API page 1"), "{error}");
++        assert!(!error.contains("no GitHub release in tag stream"), "{error}");
++    }
++}
+diff --git a/src-tauri/src/sources/mod.rs b/src-tauri/src/sources/mod.rs
+index 40bed0c..911560d 100644
+--- a/src-tauri/src/sources/mod.rs
++++ b/src-tauri/src/sources/mod.rs
+@@ -80,6 +80,8 @@ pub struct Remote {
+ #[derive(Default, Clone, Debug)]
+ pub struct ResolveOpts<'a> {
+     pub asset_hint: Option<&'a str>,
++    pub release_tag_prefix: Option<&'a str>,
++    pub asset_name_pattern: Option<&'a str>,
+     pub wago_key: Option<&'a str>,
+     pub prerelease: bool,
+     pub flavor: crate::flavor::Flavor,
+@@ -91,7 +93,8 @@ pub async fn resolve(
+     opts: ResolveOpts<'_>,
+ ) -> anyhow::Result<Remote> {
+     match src {
+-        Source::Github(repo) => github::resolve(client, repo, opts.asset_hint, opts.prerelease, opts.flavor).await,
++        Source::Github(repo) => github::resolve(client, repo, opts.asset_hint,
++            opts.release_tag_prefix, opts.asset_name_pattern, opts.prerelease, opts.flavor).await,
+         Source::Wago(id) => wago::resolve(client, id, opts.wago_key, opts.prerelease, opts.flavor).await,
+         Source::Wowi(id) => wowi::resolve(client, *id, opts.flavor).await,
+         Source::Tukui(slug) => tukui::resolve(client, slug, opts.flavor).await,

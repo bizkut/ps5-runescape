@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9][0-9].[0-9][0-9][0-9].[0-9][0-9][0-9]'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Build contentVersion (NN.NNN.NNN); manual runs do not publish'
+        required: true
+        default: '01.000.021'
+        type: string
+      clean:
+        description: 'Discard the persistent compiled-output cache before building'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forever-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 360
+    env:
+      SOURCE_ROOT: ${{ github.workspace }}/sources
+      PRODUCT: ${{ github.workspace }}/sources/ps5-proton/ps5-runescape
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      FOREVER_BUILD_CACHE: ${{ github.workspace }}/sources/.cache
+      FOREVER_CLEAN_CACHE: ${{ github.event_name == 'workflow_dispatch' && inputs.clean && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: sources/ps5-proton/ps5-runescape
+          persist-credentials: false
+      - name: Check build disk
+        run: |
+          # Never remove preinstalled tools from a persistent self-hosted machine.
+          python3 -c 'import os, shutil; free = shutil.disk_usage(os.environ["GITHUB_WORKSPACE"]).free; print(f"Build disk available: {free // (1 << 30)} GiB"); assert free >= 30 << 30, "release build requires at least 30 GiB free"'
+      - name: Check out pinned public sources
+        run: python3 "$PRODUCT/ps5/release/fetch-sources.py" "$SOURCE_ROOT"
+      - name: Build and qualify both title roles in the pinned container
+        env:
+          JOBS: ${{ vars.FOREVER_JOBS }}
+        run: bash "$PRODUCT/ps5/release/build-linux.sh" "$SOURCE_ROOT" "$RELEASE_TAG"
+      - name: Verify archive and write its catalog digest
+        working-directory: sources/ps5-proton/ps5-runescape/ps5/build/release
+        run: |
+          python3 -m zipfile --test PPSA99225.zip
+          sha256sum PPSA99225.zip > PPSA99225.zip.sha256
+      - name: Retain the exact release bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: forever-${{ env.RELEASE_TAG }}
+          path: |
+            sources/ps5-proton/ps5-runescape/ps5/build/release/PPSA99225.zip
+            sources/ps5-proton/ps5-runescape/ps5/build/release/PPSA99225.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: forever-${{ github.ref_name }}
+          path: release-artifact
+      - name: Publish the alpha release without replacing existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd release-artifact
+          sha256sum --check PPSA99225.zip.sha256
+          cd ..
+          python3 -c 'from pathlib import Path; text = Path("ps5/release/catalog-notes.md").read_text(); marker = "## Release notes (GitHub release description, shown by the catalog)"; Path("release-artifact/notes.md").write_text(text.split(marker, 1)[1].strip() + "\n")'
+          product_name=$(python3 -c 'import json; p=json.load(open("ps5/title/sce_sys/param.json"))["localizedParameters"]; print(p[p["defaultLanguage"]]["titleName"])')
+          gh release create "$RELEASE_TAG" --verify-tag --prerelease \
+            --title "$product_name $RELEASE_TAG" \
+            --notes-file release-artifact/notes.md \
+            release-artifact/PPSA99225.zip release-artifact/PPSA99225.zip.sha256
