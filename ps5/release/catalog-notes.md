@@ -2,7 +2,7 @@
 
 ## Record description (`apps/PPSA99225.json`, `description`)
 
-Jagex Launcher on PS5 for Old School RuneScape, with the official client or RuneLite; press Create+Options for the menu and L3+R3 for the on-screen keyboard.
+Jagex Launcher on PS5 for Old School RuneScape, with the official client or RuneLite; press L3+R3 for the on-screen keyboard.
 
 ## Release notes (GitHub release description, shown by the catalog)
 

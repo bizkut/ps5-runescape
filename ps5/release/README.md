@@ -40,7 +40,7 @@ and **never share it** or unreviewed logs/screenshots from it.
 
 The controller mapping is the same file for two situations ("profiles"):
 
-- **Launcher profile** – the Jagex Launcher window and the native menu.
+- **Launcher profile** – the Jagex Launcher window.
 - **OSRS profile** – the game itself, for both the official OSRS client and
   RuneLite. It is adapted from Brigsby Bear's Steam Input layout for OSRS
   ([Workshop item 3148826194](https://steamcommunity.com/sharedfiles/filedetails/?id=3148826194)).
@@ -81,7 +81,6 @@ button press.
 | R2 half-pulled + D-pad Left | F11 |
 | R2 half-pulled + D-pad Down | F12 |
 | L3 + R3 together | On-screen keyboard (text entry) |
-| Create + Options together | Reserved for the native menu (not available inside the game: it is ignored) |
 
 The touchpad does not move the pointer in the game. The F-keys are the keys
 OSRS and RuneLite use for their side-panel tabs by default, so rebind them in
@@ -98,20 +97,15 @@ launcher; the R2 + D-pad Down binding sends it to the client.
 | R2, pulled fully | Right click |
 | Circle | Escape |
 | L3 + R3 together | On-screen keyboard |
-| Create + Options together | Open or close the native menu |
 
-Buttons not listed do nothing in the launcher. The native menu is the title's own
-maintenance menu (several entries are inherited from the project this one is
-based on and are not relevant to RuneScape). In it, **D-pad Up/Down** moves,
-**Cross** selects, **Circle** goes back; the touchpad, a mouse, and Create +
-Options again also work.
+Buttons not listed do nothing in the launcher. The title has no menu of its
+own.
 
 ### Keyboard and mouse
 
 A USB keyboard and mouse are passed straight to the client: keys are sent as
-pressed, mouse movement, buttons and wheel work as on a PC. The wheel direction
-can be flipped in the native menu. On a physical keyboard, **F13** opens the
-native menu (launcher only); every other key, including F12, goes to the client.
+pressed, mouse movement, buttons and wheel work as on a PC. Every key,
+including F12, goes to the client.
 
 ### Changing the controller mapping
 
@@ -141,15 +135,15 @@ get the defaults back. Format:
   `backspace`, `tab`, `space`, `up`, `down`, `left`, `right`, `ctrl`, `shift`,
   `alt`, `super`, `home`, `end`, `delete`, `pageup`, `pagedown`; `mouse.left`,
   `mouse.right`, `mouse.middle`; `wheel.up`, `wheel.down`; `toggle.shift`;
-  `ime` (on-screen keyboard); `native.menu`. Combine keys and mouse buttons with
+  `ime` (on-screen keyboard). Combine keys and mouse buttons with
   `+` (for example `key.ctrl+mouse.left`).
 - `stick.left` / `stick.right` = `off`, `mouse`, `arrows` or `wheel`, optionally
   followed by `,invert_x` and/or `,invert_y`.
 - `touch.pointer=on|off` (touchpad moves the pointer), `threshold.long_ms`
   (10–5000, default 305), `threshold.double_ms` (10–2000, default 250),
   `layer.r2=<1–95>%` (how far R2 must be pulled for the layer, default 25 %).
-- **L3 + R3 (on-screen keyboard) and Create + Options (native menu) are reserved**
-  and cannot be rebound or reused in other chords.
+- **L3 + R3 (on-screen keyboard) and Create + Options are reserved** and cannot
+  be rebound or reused in other chords; Create + Options currently does nothing.
 
 ## RuneLite options
 
