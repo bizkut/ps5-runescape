@@ -1767,6 +1767,16 @@ done:
     return 0;
 }
 #include "runescape-install.h"
+struct rs_startup_task { int (*run)(void); const char *label; pthread_t thread; int started, result; uint64_t ms; };
+static void *rs_startup_task_run(void *argument)
+{
+    struct rs_startup_task *task = argument;
+    uint64_t start = rs_now();
+    task->result = task->run();
+    task->ms = (rs_now() - start) / 1000000u;
+    io_log("runescape: startup phase %s ms=%llu result=%d", task->label, (unsigned long long)task->ms, task->result);
+    return NULL;
+}
 #endif
 #endif
 
@@ -4096,12 +4106,36 @@ int main(int argc, char **argv)
     struct stat startup_file;
     if (!forever_prefix_init)
     {
-        if (stat(PW_RUNTIME_INSTALLER_UNIX, &startup_file) && b1_download_installer()) b1_wait();
-        if (!strcmp(PW_RUNTIME_STARTUP_MODE, "ssn") && rs_acquire_redists()) b1_wait();
-        if ((!strcmp(PW_RUNTIME_STARTUP_MODE, "launcher-trial") ||
-             (!strcmp(PW_RUNTIME_STARTUP_MODE, "ssn") &&
-              stat(PW_RUNTIME_INSTALLER_CWD "/Program Files/Jagex Launcher/.ssn-metafile.json", &startup_file))) &&
-            rs_install_native()) b1_wait();
+        /* The installer (4.5 MB), VC++ redists (~40 MB) and launcher pieces are
+         * independent; run them concurrently. Failure handling is unchanged:
+         * any failure ends in b1_wait(). */
+        int need_installer = stat(PW_RUNTIME_INSTALLER_UNIX, &startup_file) != 0;
+        int ssn = !strcmp(PW_RUNTIME_STARTUP_MODE, "ssn");
+        int need_native = !strcmp(PW_RUNTIME_STARTUP_MODE, "launcher-trial") ||
+            (ssn && stat(PW_RUNTIME_INSTALLER_CWD "/Program Files/Jagex Launcher/.ssn-metafile.json", &startup_file));
+        struct rs_startup_task task[2] = {{.run = b1_download_installer, .label = "installer"},
+                                          {.run = rs_acquire_redists, .label = "prerequisites"}};
+        int enabled[2] = {need_installer, ssn};
+        uint64_t phase_start = rs_now();
+        for (int i = 0; i < 2; i++)
+            if (enabled[i]) task[i].started = !pthread_create(&task[i].thread, NULL, rs_startup_task_run, &task[i]);
+        int native_failed = 0;
+        if (need_native)
+        {
+            uint64_t start = rs_now();
+            native_failed = rs_install_native();
+            io_log("runescape: startup phase launcher ms=%llu result=%d",
+                   (unsigned long long)((rs_now() - start) / 1000000u), native_failed);
+        }
+        for (int i = 0; i < 2; i++)
+        {
+            if (task[i].started) pthread_join(task[i].thread, NULL);
+            else if (enabled[i]) rs_startup_task_run(&task[i]);
+        }
+        io_log("runescape: startup phases wall_ms=%llu installer_ms=%llu prerequisites_ms=%llu",
+               (unsigned long long)((rs_now() - phase_start) / 1000000u),
+               (unsigned long long)(task[0].ms), (unsigned long long)(task[1].ms));
+        if ((enabled[0] && task[0].result) || (enabled[1] && task[1].result) || native_failed) b1_wait();
     }
 #if !PW_RUNTIME_HEADLESS
     title_desktop_installer_mode(0); /* no Battle.net auto-Enter heuristic */

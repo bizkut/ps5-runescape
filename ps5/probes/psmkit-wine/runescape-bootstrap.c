@@ -22,6 +22,7 @@
 #include <msi.h>
 #include "runescape-redist.h"
 #include "runescape-ssn.h"
+#include "runescape-launcher-retry.h"
 #include "sha256.h"
 #include "runescape-product.h"
 #define RS_POLICY "jagex-current-time-sha2-exclusive-g4-revocation-v1"
@@ -636,6 +637,109 @@ static int rs_publish(struct rs_manifest *m)
     if(ok) rs_logf("install complete method=ssn id=%s files=%u bytes=%llu",m->id,m->files,(unsigned long long)m->bytes);
     return ok;
 }
+/* The launcher gives its window 20 s (hard-coded) and exits with
+ * "Timeout waiting for window to load" when a cold cefcache is too slow. The
+ * restarted launcher finds the cache warm. Detect that from the launcher's own
+ * log, only for text written during this attempt, and restart a bounded number
+ * of times through the same elevated start path. */
+static ULONGLONG rs_launcher_log_size(const WCHAR *path)
+{
+    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
+    if(file==INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size={0};
+    if(!GetFileSizeEx(file,&size)) size.QuadPart=0;
+    CloseHandle(file);return (ULONGLONG)size.QuadPart;
+}
+static int rs_launcher_log_timeout(const WCHAR *path,ULONGLONG from,ULONGLONG *end)
+{
+    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,0,NULL);
+    if(file==INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size={0},at;
+    int found=0;
+    if(end) *end=0;
+    if(GetFileSizeEx(file,&size) && end) *end=(ULONGLONG)size.QuadPart;
+    if(size.QuadPart>=0 && (ULONGLONG)size.QuadPart>from) {
+        ULONGLONG want=(ULONGLONG)size.QuadPart-from;
+        if(want>(8u<<20)) want=8u<<20;
+        at.QuadPart=size.QuadPart-(LONGLONG)want;
+        char *text=malloc((size_t)want);
+        DWORD got=0;
+        if(text && SetFilePointerEx(file,at,NULL,FILE_BEGIN) && ReadFile(file,text,(DWORD)want,&got,NULL))
+            found=rs_launcher_log_has_timeout(text,got);
+        free(text);
+    }
+    CloseHandle(file);return found;
+}
+static int rs_launcher_timed_out(const WCHAR *begin_path,ULONGLONG begin_size)
+{
+    WCHAR path[260];SYSTEMTIME now;GetLocalTime(&now);
+    if(rs_launcher_log_timeout(begin_path,begin_size,NULL)) return 1;
+    /* Local midnight during the attempt moves the launcher to a new file. */
+    return rs_launcher_log_path(path,260,now.wMonth,now.wDay,now.wYear) && wcscmp(path,begin_path) &&
+        rs_launcher_log_timeout(path,0,NULL);
+}
+/* The launcher does not always exit on that timeout: it can leave an error
+ * dialog up and keep running until the user dismisses it. While it runs, poll
+ * the log text it appends and, on the timeout line, terminate every launcher
+ * process so the normal exit path below restarts it. */
+struct rs_launcher_watch {
+    WCHAR path[260];
+    ULONGLONG from;
+    HANDLE stop;
+    int killed;
+};
+static int rs_launcher_watch_poll(struct rs_launcher_watch *watch)
+{
+    ULONGLONG size=0;
+    if(rs_launcher_log_timeout(watch->path,watch->from,&size)) {
+        struct rs_launcher_processes processes={0};
+        unsigned count=0;
+        if(rs_launcher_snapshot(&processes)) {
+            for(unsigned i=0;i<processes.count;i++) if(TerminateProcess(processes.handles[i+1],ERROR_TIMEOUT)) count++;
+            rs_launcher_release(&processes);
+        }
+        rs_logf("launcher window timeout; launcher still running, terminated processes=%u",count);
+        watch->killed=1;return 1;
+    }
+    /* Rescan a small tail so a line split across two polls is still seen. */
+    if(size>watch->from+1024) watch->from=size-1024;
+    return 0;
+}
+static DWORD WINAPI rs_launcher_watch_thread(void *parameter)
+{
+    struct rs_launcher_watch *watch=parameter;
+    while(WaitForSingleObject(watch->stop,1000)==WAIT_TIMEOUT)
+        if(rs_launcher_watch_poll(watch)) break;
+    return 0;
+}
+static int rs_launch_launcher(const WCHAR *path,const WCHAR *arguments,const WCHAR *cwd,DWORD *exit)
+{
+    for(unsigned restarts=0;;restarts++) {
+        WCHAR log[260]={0};SYSTEMTIME start;GetLocalTime(&start);
+        ULONGLONG begin=rs_launcher_log_path(log,260,start.wMonth,start.wDay,start.wYear) ? rs_launcher_log_size(log) : 0;
+        if(!log[0]) rs_log("launcher log path unavailable; window-timeout recovery disabled");
+        struct rs_launcher_watch watch={.from=begin};
+        HANDLE thread=NULL;
+        if(log[0]) {
+            wcscpy(watch.path,log);
+            watch.stop=CreateEventW(NULL,TRUE,FALSE,NULL);
+            if(watch.stop) thread=CreateThread(NULL,0,rs_launcher_watch_thread,&watch,0,NULL);
+            if(!thread) rs_log("launcher log watcher unavailable; only the exit path is checked");
+        }
+        int launched=rs_launch_admin(path,arguments,cwd,exit);
+        if(thread) { SetEvent(watch.stop);WaitForSingleObject(thread,INFINITE);CloseHandle(thread); }
+        if(watch.stop) CloseHandle(watch.stop);
+        if(!launched) return 0;
+        Sleep(500); /* let the exiting launcher flush its log */
+        if(!log[0] || !rs_launcher_timed_out(log,begin)) return 1;
+        if(!rs_launcher_retry_allowed(restarts)) {
+            rs_logf("launcher window timeout; retries exhausted attempts=%u",restarts+1);
+            return 1;
+        }
+        rs_logf("launcher window timeout; restarting attempt=%u",restarts+1);
+        Sleep(1000);
+    }
+}
 int wmain(int argc,WCHAR **argv)
 {
     (void)argv;if(argc!=1) return rs_fail(L"Unexpected bootstrap arguments.");
@@ -686,6 +790,6 @@ int wmain(int argc,WCHAR **argv)
     if(launcher==INVALID_HANDLE_VALUE) { CloseHandle(installer);return rs_fail(L"Installed launcher publisher verification failed."); }
     if(!rs_prepare_redists()) { CloseHandle(launcher);CloseHandle(installer);return rs_fail(L"Microsoft Visual C++ prerequisite installation did not complete. No launcher was started. See C:\\RuneScape\\VC_redist.*.install.log (or *.remove.log), close the title and retry."); }
     rs_log("launcher begin role=maintenance backend=inherited elevation=runas prerequisites=ready");
-    DWORD exit=1;int completed=rs_launch_admin(RS_LAUNCHER,RS_BROWSER_ARGUMENTS,RS_INSTALL,&exit);
+    DWORD exit=1;int completed=rs_launch_launcher(RS_LAUNCHER,RS_BROWSER_ARGUMENTS,RS_INSTALL,&exit);
     CloseHandle(launcher);CloseHandle(installer);return completed ? (int)exit : 1;
 }

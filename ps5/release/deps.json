@@ -9,10 +9,10 @@
     {
       "name": "ps5-wine",
       "url": "https://github.com/bizkut/ps5-forever-wine.git",
-      "commit": "6d2b35a5e41075daa56edb9fb2dfa0d0a1629f11",
-      "original_commit": "6d2b35a5e41075daa56edb9fb2dfa0d0a1629f11",
-      "content_sha256": "e5d78a6308c95e2f4c2477f72cba9d7dabcb993e493af33ad6066ea9a5751ed6",
-      "describe": "wine-8.0-runescape-r2-6d2b35a5e410",
+      "commit": "cf743b9b4f6c96b711d167296140203e60999c5a",
+      "original_commit": "cf743b9b4f6c96b711d167296140203e60999c5a",
+      "content_sha256": "ae41053cf132e416f0c589833e1f65db12a095043d13e531f79764deb075fe22",
+      "describe": "wine-8.0-runescape-r2-cf743b9b4f6c",
       "path": "ps5-proton/ps5-wine"
     },
     {

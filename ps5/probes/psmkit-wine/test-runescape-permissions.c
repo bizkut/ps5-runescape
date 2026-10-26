@@ -123,7 +123,8 @@ int main(int argc, char **argv)
     pw_game_handoff_token(handoff_token, entropy);
     assert(!pw_game_handoff_write(handoff, handoff_token, &handoff_wire, NULL));
     assert(!pw_game_handoff_path(handoff, handoff_token, handoff_file));
-    assert(mode_of(handoff) == 0700 && mode_of(handoff_file) == 0600);
+    assert(mode_of(handoff_file) == 0600); /* the directory mode is repaired by startup repair, below */
+    /* The shared-mode policy does not widen the session file or the directory. */
     assert(!chmod(handoff, 0700) && !chmod(handoff_file, 0600));
     assert(mode_of(handoff) == 0700 && mode_of(handoff_file) == 0600);
     assert(!wine_ps5_shared_resolve(alias_handoff, resolved_handoff, realpath));
@@ -212,7 +213,7 @@ int main(int argc, char **argv)
     assert(mode_of(root) == 0777 && mode_of(directory) == 0777);
     assert(mode_of(regular) == 0666 && mode_of(stream) == 0666 && mode_of(executable) == 0766);
     assert(mode_of(outside_file) == 0600 && mode_of(fifo) == 0600);
-    assert(mode_of(handoff) == (enabled ? 0700 : 0777));
+    assert(mode_of(handoff) == 0777); /* the directory is repaired at startup; session files stay 0600 */
     assert(mode_of(handoff_file) == (enabled ? 0600 : 0666));
     assert(mode_of(handoff_neighbor) == 0777 && mode_of(nested_handoff) == 0777);
     if (enabled) {

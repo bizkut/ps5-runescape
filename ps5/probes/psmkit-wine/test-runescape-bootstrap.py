@@ -40,7 +40,7 @@ for required in ('WinVerifyTrust(', 'WTHelperGetProvSignerFromChain(',
 assert 'WTD_REVOCATION_CHECK_NONE' not in source
 assert 'CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY' not in source
 assert 'WTD_CACHE_ONLY_URL_RETRIEVAL' not in source
-assert source.index('if(!rs_prepare_redists())') < source.index('rs_launch_admin(RS_LAUNCHER,')
+assert source.index('if(!rs_prepare_redists())') < source.index('rs_launch_launcher(RS_LAUNCHER,')
 # Bootstrap diagnostics must use Wine's direct debug writer, not the CRT's
 # stdout handle, which is not a reliable klog route in the title parent.
 assert 'GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"__wine_dbg_write")' in source
@@ -48,6 +48,8 @@ assert 'prerequisite msi-enum arch=' in source
 assert 'prerequisite msi-product arch=' in source
 assert 'prerequisite launch stage=' in source
 assert 'ProcessWineGrantAdminToken' not in source
+assert 'rs_launch_admin(RS_LAUNCHER,' not in source
+assert 'launcher window timeout; restarting attempt=%u' in source
 logger_function = 'static void rs_logf(' + source.split('static void rs_logf(', 1)[1].split(
     'static void rs_log(', 1)[0]
 logger_harness = r'''
@@ -510,6 +512,192 @@ int main(void)
     return 0;
 }
 '''
+
+retry_function = 'static ULONGLONG rs_launcher_log_size(' + source.split(
+    'static ULONGLONG rs_launcher_log_size(', 1)[1].split('int wmain(', 1)[0]
+retry_harness = r"""
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#include "runescape-launcher-retry.h"
+typedef wchar_t WCHAR;
+typedef unsigned long DWORD;
+typedef unsigned long long ULONGLONG;
+typedef long long LONGLONG;
+typedef void *HANDLE;
+typedef int BOOL;
+typedef struct { LONGLONG QuadPart; } LARGE_INTEGER;
+typedef struct { unsigned short wYear,wMonth,wDayOfWeek,wDay,wHour,wMinute,wSecond,wMilliseconds; } SYSTEMTIME;
+#define GENERIC_READ 1
+#define FILE_SHARE_READ 1
+#define FILE_SHARE_WRITE 2
+#define FILE_SHARE_DELETE 4
+#define OPEN_EXISTING 3
+#define FILE_BEGIN 0
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#define WINAPI
+#define TRUE 1
+#define FALSE 0
+#define WAIT_TIMEOUT 258
+#define WAIT_OBJECT_0 0
+#define INFINITE 0xffffffff
+#define ERROR_TIMEOUT 1460
+struct rs_launcher_processes { HANDLE handles[33];DWORD pids[32];unsigned count; };
+static unsigned live_launchers,terminated;
+static int rs_launcher_snapshot(struct rs_launcher_processes *p)
+{
+    p->count=live_launchers;
+    for(unsigned i=0;i<live_launchers;i++) p->handles[i+1]=(HANDLE)(intptr_t)(100+i);
+    return 1;
+}
+static void rs_launcher_release(struct rs_launcher_processes *p) { p->count=0; }
+static int TerminateProcess(HANDLE h,unsigned code) { assert((intptr_t)h>=100 && code==ERROR_TIMEOUT);terminated++;live_launchers--;return 1; }
+static void rs_logf(const char *format,...);
+static void rs_log(const char *text) { rs_logf("%s",text); }
+static char logged[16][160];static unsigned logged_count;
+static void rs_logf(const char *format,...)
+{
+    va_list args;va_start(args,format);
+    vsnprintf(logged[logged_count%16],sizeof(logged[0]),format,args);va_end(args);logged_count++;
+}
+/* Two in-memory files: today's launcher log and the next local day's. */
+static unsigned short today=24;
+static char *files[2];static size_t sizes[2];static int exists[2];
+static int slot_of(const WCHAR *path) { return wcsstr(path,L".10.24.2026.")?0:wcsstr(path,L".10.25.2026.")?1:-1; }
+static HANDLE CreateFileW(const WCHAR *path,DWORD a,DWORD b,void *c,DWORD d,DWORD e,void *f)
+{
+    assert(a==GENERIC_READ && b==7 && !c && d==OPEN_EXISTING && !e && !f);
+    int slot=slot_of(path);assert(slot>=0);
+    return exists[slot] ? (HANDLE)(intptr_t)(slot+1) : INVALID_HANDLE_VALUE;
+}
+static int GetFileSizeEx(HANDLE h,LARGE_INTEGER *size) { size->QuadPart=(LONGLONG)sizes[(intptr_t)h-1];return 1; }
+static size_t cursor;
+static int SetFilePointerEx(HANDLE h,LARGE_INTEGER at,LARGE_INTEGER *out,DWORD how)
+{ assert(h && !out && how==FILE_BEGIN && at.QuadPart>=0);cursor=(size_t)at.QuadPart;return 1; }
+static int ReadFile(HANDLE h,void *buffer,DWORD n,DWORD *got,void *overlapped)
+{
+    int slot=(int)(intptr_t)h-1;assert(!overlapped && cursor+n<=sizes[slot]);
+    memcpy(buffer,files[slot]+cursor,n);*got=n;return 1;
+}
+static int CloseHandle(HANDLE h) { assert(h);return 1; }
+/* Watcher: the thread body runs inside the stubbed launch, polling a scripted
+ * number of ticks while the launcher is "alive". */
+static DWORD (*thread_proc)(void *);static void *thread_arg;static int thread_ok,stopped_events;
+static unsigned ticks_left;
+static HANDLE CreateEventW(void *s,int manual,int initial,const WCHAR *name)
+{ assert(!s && manual && !initial && !name);return (HANDLE)5; }
+static HANDLE CreateThread(void *s,size_t stack,DWORD (*proc)(void *),void *arg,DWORD flags,DWORD *id)
+{ assert(!s && !stack && !flags && !id);thread_proc=proc;thread_arg=arg;return thread_ok ? (HANDLE)6 : NULL; }
+static int SetEvent(HANDLE h) { assert(h==(HANDLE)5);stopped_events++;return 1; }
+static DWORD WaitForSingleObject(HANDLE h,DWORD ms)
+{
+    if(h==(HANDLE)6) { assert(ms==INFINITE);return WAIT_OBJECT_0; }
+    assert(h==(HANDLE)5 && ms==1000);
+    return ticks_left-- ? WAIT_TIMEOUT : WAIT_OBJECT_0;
+}
+static void GetLocalTime(SYSTEMTIME *t) { memset(t,0,sizeof(*t));t->wYear=2026;t->wMonth=10;t->wDay=today; }
+static unsigned sleeps;static DWORD slept;
+static void Sleep(DWORD ms) { sleeps++;slept+=ms; }
+static void append(int slot,const char *text)
+{
+    size_t n=strlen(text);files[slot]=realloc(files[slot],sizes[slot]+n);
+    memcpy(files[slot]+sizes[slot],text,n);sizes[slot]+=n;exists[slot]=1;
+}
+/* Scripted launcher: each start appends its log lines, then exits. */
+static const char *script[4][2];static unsigned starts;static int admin_ok;
+/* Per start: appended text becomes visible after `alive_ticks[n]` watcher
+ * ticks, with the launcher process alive the whole time (error dialog up). */
+static const char *alive_text[4];static unsigned alive_ticks[4];
+static int rs_launch_admin(const WCHAR *path,const WCHAR *arguments,const WCHAR *cwd,DWORD *exit)
+{
+    assert(!wcscmp(path,L"launcher") && !wcscmp(arguments,L"--arg") && !wcscmp(cwd,L"cwd"));
+    unsigned n=starts++;
+    live_launchers=2;ticks_left=alive_ticks[n]+1;
+    if(thread_proc && alive_text[n]) {
+        /* Quiet ticks first, then the launcher writes its error line. */
+        unsigned quiet=alive_ticks[n];
+        ticks_left=quiet;thread_proc(thread_arg);
+        append(0,alive_text[n]);
+        ticks_left=3;thread_proc(thread_arg);
+        if(!live_launchers) { *exit=1;return admin_ok; } /* killed: the process tree is gone */
+    }
+    if(script[n][0]) append(0,script[n][0]);
+    if(script[n][1]) { today=25;append(1,script[n][1]); }
+    *exit=7+n;return admin_ok;
+}
+"""
+retry_cases = r"""
+static const char *started="2026-10-24T08:40:44.000+08 INFO - Process Id: 44\r\n";
+static const char *timeout="2026-10-24T08:41:29.000+08 ERROR - Timeout waiting for window to load\r\n";
+static const char *console="2026-10-24T08:41:29.000+08 CONSOLE - ERROR - Timeout waiting for window to load\r\n";
+static void reset(void)
+{
+    for(unsigned i=0;i<2;i++) { free(files[i]);files[i]=NULL;sizes[i]=0;exists[i]=0; }
+    memset(script,0,sizeof(script));memset(alive_text,0,sizeof(alive_text));memset(alive_ticks,0,sizeof(alive_ticks));
+    thread_proc=NULL;thread_ok=1;terminated=stopped_events=0;live_launchers=0;starts=sleeps=0;slept=0;logged_count=0;today=24;admin_ok=1;
+}
+int main(void)
+{
+    DWORD exit=0;
+    /* Healthy start: no timeout, no restart. */
+    reset();script[0][0]=started;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && exit==7 && !logged_count);
+    /* No log file at all (launcher never wrote one): single start. */
+    reset();assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !logged_count);
+    /* Cold-start timeout then a good warm start: exactly one restart, one marker. */
+    reset();script[0][0]=timeout;script[1][0]=started;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==2 && exit==8);
+    assert(logged_count==1 && !strcmp(logged[0],"launcher window timeout; restarting attempt=1"));
+    /* A timeout from an earlier session already in the file is not a new timeout. */
+    reset();append(0,timeout);script[0][0]=started;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !logged_count);
+    /* A page console line quoting the text does not restart. */
+    reset();script[0][0]=console;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !logged_count);
+    /* Persistent timeout is bounded: first start + RS_LAUNCHER_RETRY_MAX restarts. */
+    reset();script[0][0]=timeout;script[1][0]=timeout;script[2][0]=timeout;script[3][0]=timeout;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==3 && exit==9);
+    assert(logged_count==3 && !strcmp(logged[0],"launcher window timeout; restarting attempt=1") &&
+           !strcmp(logged[1],"launcher window timeout; restarting attempt=2") &&
+           !strcmp(logged[2],"launcher window timeout; retries exhausted attempts=3"));
+    /* Timeout then user closes normally on the retry. */
+    reset();script[0][0]=timeout;script[1][0]=started;script[2][0]=timeout;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==2);
+    /* Local midnight mid-attempt: the timeout lands in the next day's log. */
+    reset();append(0,started);script[0][1]=timeout;script[1][0]=NULL;
+    today=24;assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==2 && logged_count==1);
+    /* Error dialog keeps the launcher alive: the line is seen by the watcher,
+     * the process tree is terminated, and the same retry bound restarts it. */
+    reset();alive_text[0]=timeout;alive_ticks[0]=2;script[1][0]=started;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==2 && terminated==2);
+    assert(logged_count==2 && strstr(logged[0],"launcher still running, terminated processes=2") &&
+           !strcmp(logged[1],"launcher window timeout; restarting attempt=1") && stopped_events==2);
+    /* Timeout appears while alive on every start: killed each time, bounded. */
+    reset();for(unsigned i=0;i<4;i++) { alive_text[i]=timeout;alive_ticks[i]=1; }
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==3 && terminated==6);
+    assert(!strcmp(logged[logged_count-1],"launcher window timeout; retries exhausted attempts=3"));
+    /* A healthy running launcher (no timeout line) is never killed or restarted. */
+    reset();alive_text[0]=started;alive_ticks[0]=3;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !terminated && !logged_count);
+    /* A quoted console line while alive is not a timeout. */
+    reset();alive_text[0]=console;alive_ticks[0]=1;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !terminated && !logged_count);
+    /* Text from an earlier session in the same file does not kill a new launcher. */
+    reset();append(0,timeout);alive_text[0]=started;alive_ticks[0]=2;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !terminated);
+    /* No watcher thread available: exit path still recovers. */
+    reset();thread_ok=0;script[0][0]=timeout;script[1][0]=started;
+    assert(rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==2 && !terminated);
+    /* A failed elevated start is a failure, not a retry. */
+    reset();admin_ok=0;script[0][0]=timeout;
+    assert(!rs_launch_launcher(L"launcher",L"--arg",L"cwd",&exit) && starts==1 && !logged_count);
+    puts("runescape launcher window-timeout recovery: bounded restart from the launcher log PASS");
+    return 0;
+}
+"""
 compiler = Path(os.environ.get('LLVM_MINGW', '/opt/llvm-mingw')) / 'bin/x86_64-w64-mingw32-clang'
 # Keep all compiler outputs in this development checkout, including on failure.
 with tempfile.TemporaryDirectory(prefix='.runescape-bootstrap-test-', dir=here) as folder:
@@ -549,6 +737,13 @@ with tempfile.TemporaryDirectory(prefix='.runescape-bootstrap-test-', dir=here) 
                     '-Wall', '-Wextra', '-Werror', '-I', str(here),
                     str(work / 'test-prerequisites.c'), '-o', str(prerequisites)], check=True)
     subprocess.run([str(prerequisites)], check=True)
+    retry = work / 'test-launcher-retry'
+    (work / 'test-launcher-retry.c').write_text(
+        '#include <stdarg.h>\n' + retry_harness + retry_function + retry_cases)
+    subprocess.run([*shlex.split(os.environ.get('HOST_CC', 'cc')), '-std=gnu11',
+                    '-Wall', '-Wextra', '-Werror', '-I', str(here),
+                    str(work / 'test-launcher-retry.c'), '-o', str(retry)], check=True)
+    subprocess.run([str(retry)], check=True)
     output = work / 'runescape-bootstrap.exe'
     subprocess.run([str(compiler), '-std=c11', '-Os', '-s', '-static', '-municode',
                     '-Wall', '-Wextra', '-Werror', '-Wl,--no-insert-timestamp',

@@ -300,6 +300,15 @@ int main(int argc, char **argv)
     /* Compositor mode: NULL keeps the last visible pointer (logged once);
      * destroying that cursor ends the substitution. Direct mode hides. */
     assert(!setenv("WINEPS5_TITLE_PRESENT", "compositor", 1));
+    /* A start-up NULL before any cursor was ever set must not hide the pointer: the
+     * hardware pointer stays as it is (not even published), logged once. */
+    driver_log[0] = 0;
+    before = native_sent;
+    installed_driver.pSetCursor((void *)101, NULL);
+    assert(native_sent == before && shape->visible && strstr(driver_log, "null ignored=1 mode=compositor"));
+    driver_log[0] = 0;
+    installed_driver.pSetCursor((void *)101, NULL);
+    assert(native_sent == before && !driver_log[0]);
     installed_driver.pSetCursor((void *)101, (void *)9001);
     assert(shape->visible && shape->pixels[0] == 0x80402010);
     driver_log[0] = 0;
@@ -335,6 +344,15 @@ int main(int argc, char **argv)
     installed_driver.pSetCursor((void *)101, NULL);
     assert(!shape->visible);
     installed_driver.pDestroyCursorIcon((void *)9003);
+    /* A cursor the conversion refuses (65 pixels wide) is logged, bounded, not silent. */
+    assert(!setenv("WINEPS5_TITLE_PRESENT", "compositor", 1));
+    width = 65;
+    driver_log[0] = 0;
+    installed_driver.pSetCursor((void *)101, (void *)9004);
+    assert(strstr(driver_log, "handle=0x232c convert=failed mode=compositor"));
+    width = 4;
+    installed_driver.pDestroyCursorIcon((void *)9004);
+    assert(!unsetenv("WINEPS5_TITLE_PRESENT"));
     puts("compositor cursor: NULL/transparent keep last visible pointer, destroy clears, direct hides/keeps PASS");
 #endif
     puts("desktop + win32u title-GPU cursor tables: PASS (shared conversion/cache, native pixels/hotspot/hide/destroy)");

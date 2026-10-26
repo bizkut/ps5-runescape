@@ -6,6 +6,23 @@ Jagex Launcher on PS5 for Old School RuneScape, with the official client or Rune
 
 ## Release notes (GitHub release description, shown by the catalog)
 
+### 01.000.022
+
+- A fresh install now reaches a working launcher: the launcher restarts
+  automatically after the first-start window timeout, and the out-of-memory
+  crash at sign-in is fixed.
+- The "process capacity reached" error is fixed.
+- `/data/runescape` can now be deleted completely over FTP and the title
+  reinstalled without restarting the PS5 (the Play handoff folder is no longer
+  private; its session files stay unreadable by other apps).
+- The Jagex Launcher download is faster (parallel download).
+- RuneLite mouse pointer fix.
+- Docs: the README controls table is corrected; the title has no Create+Options
+  menu.
+
+Known limits: the first install takes about 9-10 minutes; RuneScape 3 and HDOS
+are not supported.
+
 ### 01.000.021 — first public RuneScape prerelease
 
 Unofficial, experimental PS5 homebrew (title `PPSA99225`) that runs the official

@@ -2,6 +2,8 @@
 #include "runtime-relaunch.h"
 #include <unistd.h>
 #include <sys/stat.h>
+#include <grp.h>
+#include <sys/wait.h>
 static int test_fstat(int fd, struct stat *status);
 static ssize_t test_write(int fd, const void *data, size_t bytes);
 #define write test_write
@@ -49,7 +51,12 @@ static void test_private_handoff(const struct pw_game_wire *wire, const uint16_t
     assert(!pw_game_handoff_token_valid("../outside"));
     assert(!pw_game_handoff_prepare(directory, &removed, &diagnostic) && !removed);
     assert(!diagnostic.error && !strcmp(diagnostic.operation, "ready"));
-    assert(!stat(directory, &status) && (status.st_mode & 07777) == 0700);
+    /* An existing 0700 directory (left by 01.000.021) must not fail prepare; it is repaired. */
+    assert(!pw_game_handoff_prepare(directory, &removed, &diagnostic) && !removed);
+    assert(!diagnostic.error && !stat(directory, &status) && (status.st_mode & 07777) == 0777);
+    assert(!chmod(directory, 0700));
+    assert(!pw_game_handoff_prepare(directory, &removed, NULL) && !removed);
+    assert(!stat(directory, &status) && (status.st_mode & 07777) == 0777);
     assert(!pw_game_handoff_path(directory, token, path));
     assert(!pw_game_handoff_write(directory, token, wire, &diagnostic));
     assert(!diagnostic.error && diagnostic.links == 1 && (diagnostic.file_mode & 07777) == 0600);
@@ -134,6 +141,27 @@ static void test_private_handoff(const struct pw_game_wire *wire, const uint16_t
     assert(!pw_game_handoff_prepare(directory, &removed, NULL) && !removed);
     assert(!stat(other, &status)); /* only own-token names are stale handoffs */
     assert(!unlink(other));
+    /* FTP-style deletion: a non-owner can unlink a session file in the 0777 directory
+     * but cannot read it (0600). A real foreign uid needs root; otherwise the
+     * permission bits that grant those rights are asserted. */
+    assert(!pw_game_handoff_write(directory, token, wire, NULL));
+    assert(!stat(directory, &status) && (status.st_mode & 0003) == 0003);
+    assert(!stat(path, &status) && (status.st_mode & 0077) == 0);
+    if (geteuid() == 0) {
+        pid_t child = fork();
+        int wait_status;
+        assert(child >= 0);
+        if (!child) {
+            if (setgroups(0, NULL) || setgid(65534) || setuid(65534)) _exit(2);
+            if (open(path, O_RDONLY) >= 0 || errno != EACCES) _exit(3);
+            if (unlink(path)) _exit(4);
+            _exit(0);
+        }
+        assert(waitpid(child, &wait_status, 0) == child && WIFEXITED(wait_status) && !WEXITSTATUS(wait_status));
+        assert(access(path, F_OK) == -1 && errno == ENOENT);
+    } else {
+        assert(!unlink(path));
+    }
     assert(!pw_game_handoff_write(directory, token, wire, NULL));
     assert(!pw_game_handoff_discard(directory, token, NULL));
     assert(access(path, F_OK) == -1 && errno == ENOENT);

@@ -59,6 +59,8 @@ launcher_switches = maintenance['browser_switches']['JagexLauncher.exe']
 for switch in ('--disable-gpu', '--disable-gpu-compositing', '--disable-software-rasterizer'):
     assert switch in launcher_switches, switch
 assert '--in-process-gpu' in launcher_switches
+# Decoded-image shared memory (3-4 x 40+ MB per page) must be bounded: the 1-GiB flexible pool is shared by 7 children.
+assert '--enable-low-end-device-mode' in launcher_switches
 assert '--disable-features=AudioServiceOutOfProcess' in launcher_switches
 assert '--enable-features=NetworkServiceInProcess2' in launcher_switches
 assert not any(switch.startswith('--use-angle=') for switch in launcher_switches)

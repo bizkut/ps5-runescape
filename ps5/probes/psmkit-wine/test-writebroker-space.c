@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -41,6 +42,9 @@ sigset_t ps5_title_block_set;
 static char directory[] = "/tmp/writebroker-space-XXXXXX";
 static char menu_prefix_root[1024];
 static char token_path[1024];
+static char orphan_root[1024], orphan_token[1024];
+static int orphan_listener = -1;
+static unsigned int orphan_exit_calls;
 static char writes_path[1024];
 static char osrs_data_path[1024], osrs_index_path[1024];
 static char repair_data_root[1024];
@@ -292,6 +296,14 @@ static int fake_startup_token(void)
     return 0;
 }
 
+/* Stand-in for exit(0): the broker's exit releases its port, so close the
+ * listener that plays the part of port WB_PORT. */
+static void orphan_exit_hook(void)
+{
+    orphan_exit_calls++;
+    if (orphan_listener >= 0) { close(orphan_listener); orphan_listener = -1; }
+}
+
 #define statfs test_statfs
 #define open(...) server_open(__VA_ARGS__)
 #define pread(fd, buffer, length, offset) server_pread(fd, buffer, length, offset)
@@ -314,8 +326,14 @@ enum { TEST_REPAIR_MAX_ENTRIES = 32, TEST_REPAIR_MAX_DEPTH = 8 };
 #define WB_REPAIR_CLOSEDIR repair_test_closedir
 #define WB_STARTUP_REPAIR fake_startup_repair
 #define WB_STARTUP_WRITE_TOKEN fake_startup_token
+#define WB_BROKER_ROOT orphan_root
+#define WB_BROKER_TOKEN_FILE orphan_token
+#define WB_ORPHAN_EXIT() orphan_exit_hook()
 #include "writebroker-server.inc"
 #undef fstat
+#undef WB_ORPHAN_EXIT
+#undef WB_BROKER_TOKEN_FILE
+#undef WB_BROKER_ROOT
 #undef WB_STARTUP_WRITE_TOKEN
 #undef WB_STARTUP_REPAIR
 #undef WB_REPAIR_CLOSEDIR
@@ -393,6 +411,123 @@ static struct wb_statfs_reply query(int fd, const char *path)
     assert(!transfer(fd, (void *)path, request.path_length, 1));
     assert(!transfer(fd, &reply, sizeof(reply), 0));
     return reply;
+}
+
+static void orphan_put(const char *path, const void *bytes, size_t length)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    assert(fd >= 0 && write(fd, bytes, length) == (ssize_t)length);
+    close(fd);
+}
+
+/* A TCP listener on loopback stands in for port WB_PORT. */
+static int orphan_bind(unsigned short port)
+{
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(port),
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+
+    assert(fd >= 0 && !setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address))) { close(fd); return -1; }
+    assert(!listen(fd, 4));
+    return fd;
+}
+
+/* One title connection through the real serve(): returns after serve finished. */
+static void orphan_connect(unsigned short port, const struct wb_hello *hello, int send_hello)
+{
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(port),
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    struct wb_reply reply;
+    pthread_t thread;
+    int client, server;
+
+    client = socket(AF_INET, SOCK_STREAM, 0);
+    assert(client >= 0 && !connect(client, (struct sockaddr *)&address, sizeof(address)));
+    server = accept(orphan_listener, NULL, NULL);
+    assert(server >= 0);
+    assert(!pthread_create(&thread, NULL, serve, (void *)(intptr_t)server));
+    if (send_hello)
+    {
+        assert(!transfer(client, (void *)hello, sizeof(*hello), 1));
+        /* a refused hello is answered by a clean close, never data */
+        check(transfer(client, &reply, sizeof(reply), 0) != 0 || !reply.result,
+              "orphan: refused hello is closed or answered");
+    }
+    close(client);
+    assert(!pthread_join(thread, NULL));
+}
+
+static void orphan_tests(void)
+{
+    struct wb_hello wrong = {.magic = WB_MAGIC, .version = WB_VERSION};
+    struct wb_hello right = {.magic = WB_MAGIC, .version = WB_VERSION};
+    unsigned char other[WB_TOKEN_BYTES];
+    char moved[1100];
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    unsigned short port;
+    int replacement;
+
+    memcpy(right.token, token, sizeof(token));
+    memset(wrong.token, 0xa5, sizeof(wrong.token));
+    memset(other, 0x5a, sizeof(other));
+    snprintf(orphan_root, sizeof(orphan_root), "%s/orphan-root", directory);
+    snprintf(orphan_token, sizeof(orphan_token), "%s/.writebroker-token", orphan_root);
+    snprintf(moved, sizeof(moved), "%s/orphan-root-moved", directory);
+    assert(!mkdir(orphan_root, 0700));
+    orphan_put(orphan_token, token, sizeof(token));
+    broker_record_root();
+    check(!broker_orphaned(), "orphan: intact root and token file is not orphaned");
+
+    /* the port holder: a wrong token cannot make an intact broker exit */
+    orphan_listener = orphan_bind(0);
+    assert(orphan_listener >= 0 && !getsockname(orphan_listener, (struct sockaddr *)&address, &length));
+    port = ntohs(address.sin_port);
+    orphan_exit_calls = 0;
+    orphan_connect(port, &wrong, 1);
+    orphan_connect(port, NULL, 0);
+    broker_exit_if_orphaned();
+    check(!orphan_exit_calls && orphan_listener >= 0, "orphan: wrong token or bare connect cannot kill an intact broker");
+    check(orphan_bind(port) < 0 && errno == EADDRINUSE, "orphan: intact broker keeps its port");
+    orphan_connect(port, &right, 1);
+    check(!orphan_exit_calls, "orphan: matching hello leaves the broker running");
+
+    /* the user deleted the token file (wiped /data/runescape): a title that
+     * finds no token connects and hangs up without a hello */
+    assert(!unlink(orphan_token));
+    check(broker_orphaned() && !strcmp(broker_orphaned(), "token file is gone"), "orphan: missing token file detected");
+    orphan_connect(port, NULL, 0);
+    check(orphan_exit_calls == 1 && orphan_listener < 0, "orphan: hello-less connect with token file gone makes the broker exit");
+    replacement = orphan_bind(port);
+    check(replacement >= 0, "orphan: a new broker can take the freed port");
+    if (replacement >= 0) close(replacement);
+
+    /* token file recreated with another token: a refused hello triggers exit */
+    orphan_put(orphan_token, other, sizeof(other));
+    check(broker_orphaned() && strstr(broker_orphaned(), "no longer holds"), "orphan: changed token detected");
+    orphan_listener = orphan_bind(port);
+    assert(orphan_listener >= 0);
+    orphan_connect(port, &wrong, 1);
+    check(orphan_exit_calls == 2 && orphan_listener < 0, "orphan: refused hello with a different token file makes the broker exit");
+    orphan_put(orphan_token, token, sizeof(token) - 1);
+    check(broker_orphaned() && strstr(broker_orphaned(), "no longer holds"), "orphan: truncated token detected");
+    orphan_put(orphan_token, token, sizeof(token));
+    check(!broker_orphaned(), "orphan: restored token is accepted");
+
+    /* the idle tick path: root removed, or replaced by another directory */
+    assert(!rename(orphan_root, moved));
+    check(broker_orphaned() && !strcmp(broker_orphaned(), "user-data root is gone"), "orphan: missing root detected");
+    assert(!mkdir(orphan_root, 0700));
+    orphan_put(orphan_token, token, sizeof(token));
+    check(broker_orphaned() && !strcmp(broker_orphaned(), "user-data root was replaced"),
+          "orphan: replaced root detected even when a matching token file exists");
+    orphan_exit_calls = 0;
+    broker_exit_if_orphaned();
+    check(orphan_exit_calls == 1, "orphan: idle tick exits an orphaned broker");
+    broker_record_root();
+    check(!broker_orphaned(), "orphan: a freshly started broker records the new root");
 }
 
 static void protocol_tests(void)
@@ -636,8 +771,13 @@ static void permission_repair_tests(void)
           "startup repair skips multiply-linked regular files");
     check(fixture_mode(other_device) == 0400,
           "startup repair skips an entry reported on another device");
+#ifdef WINE_PS5_RUNESCAPE
+    check(fixture_mode(handoff) == 0777 && fixture_mode(handoff_secret) == 0600,
+          "startup repair makes the handoff directory 0777 but leaves its 0600 session files");
+#else
     check(fixture_mode(handoff) == 0700 && fixture_mode(handoff_secret) == 0600,
-          "startup repair preserves the private top-level handoff directory and its contents");
+          "non-RuneScape startup repair does not touch the handoff directory");
+#endif
     check(fixture_mode(nested_handoff) == 0666,
           "nested prefix/handoff is ordinary shared data, not the private top-level exception");
 #ifdef WINE_PS5_RUNESCAPE
@@ -661,9 +801,33 @@ static void permission_repair_tests(void)
     assert(data_fd >= 0);
 #ifdef WINE_PS5_RUNESCAPE
     memset(&repair, 0, sizeof(repair));repair.device = device;
-    check(!repair_root(data_fd, "runescape/handoff", 1, &repair) && repair.skipped == 1 &&
-          !repair.changed && fixture_mode(handoff) == 0700 && fixture_mode(handoff_secret) == 0600,
-          "direct repair-root calls cannot bypass the private subtree exclusion");
+    assert(!chmod(handoff, 0700));
+    check(!repair_root(data_fd, "runescape/handoff", 1, &repair) && repair.changed == 1 &&
+          fixture_mode(handoff) == 0777 && fixture_mode(handoff_secret) == 0600,
+          "direct repair-root of the handoff directory repairs 0700 to 0777 without recursing");
+    memset(&repair, 0, sizeof(repair));repair.device = device;
+    check(!repair_root(data_fd, "runescape/handoff/request", 1, &repair) && repair.skipped == 1 &&
+          !repair.changed && fixture_mode(handoff_secret) == 0600,
+          "direct repair-root calls cannot widen a session file");
+    /* FTP-style deletion: with the directory 0777 a non-owner may unlink the 0600 file
+     * (but not read it). A real foreign uid needs root; otherwise assert the bits. */
+    assert((fixture_mode(handoff) & 0003) == 0003 && (fixture_mode(handoff_secret) & 0077) == 0);
+    if (geteuid() == 0)
+    {
+        pid_t child_pid = fork();
+        int wait_status;
+        assert(child_pid >= 0);
+        if (!child_pid)
+        {
+            if (setgroups(0, NULL) || setgid(65534) || setuid(65534)) _exit(2);
+            if (open(handoff_secret, O_RDONLY) >= 0 || errno != EACCES) _exit(3);
+            _exit(unlink(handoff_secret) ? 4 : 0);
+        }
+        assert(waitpid(child_pid, &wait_status, 0) == child_pid && WIFEXITED(wait_status) &&
+               !WEXITSTATUS(wait_status));
+        fixture_put(handoff_secret, "synthetic private request");
+        assert(!chmod(handoff_secret, 0600));
+    }
 #endif
     assert(!rmdir(home));
     assert(!symlink(outside, home));
@@ -2333,6 +2497,7 @@ int main(void)
 #endif
     osrs_identical_metadata_contract();
     osrs_disconnect_contracts();
+    orphan_tests();
     protocol_tests();
     menu_removal_tests();
     permission_repair_tests();

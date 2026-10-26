@@ -4,19 +4,30 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "forever-download.h"
 #define PW_RUNTIME_INSTALLER_CWD "test-runescape-install-work"
 #include "runescape-redist.h"
 static const unsigned char good[]={0x6e,0x2b,0x3b,0x61,0,2,0x1f,0x8b,8,0,0,0,0,0,0,3,
     1,3,0,0xfc,0xff,'a','b','c',0xc2,0x41,0x24,0x35,3,0,0,0};
 static unsigned calls;
-static int corrupt_piece,wrong_size,fail_fetch,mixed_pieces,corrupt_stored,unknown_method;
-static unsigned redist_calls,redist_fail;
-static char failure[1024];
+static int corrupt_piece,wrong_size,fail_fetch,mixed_pieces,corrupt_stored,unknown_method,ordered,ordered_corrupt=-1;
+static unsigned redist_calls,redist_fail,active,max_active;
+static char failure[1024],timing[1024];
+static pthread_mutex_t mock_mutex=PTHREAD_MUTEX_INITIALIZER;
+#define ORDERED_PIECES 24u
+static char ordered_hex[ORDERED_PIECES][65],ordered_b64[ORDERED_PIECES][45];
+static unsigned char ordered_data[ORDERED_PIECES][3];
 static void b1_message(const char *text) { (void)text; }
 static void io_log(const char *format,...)
 {
-    va_list ap;va_start(ap,format);vsnprintf(failure,sizeof(failure),format,ap);va_end(ap);
+    char line[1024];
+    va_list ap;va_start(ap,format);vsnprintf(line,sizeof(line),format,ap);va_end(ap);
+    pthread_mutex_lock(&mock_mutex);
+    if(strncmp(line,"runescape: ssn timing",21)) memcpy(failure,line,sizeof(failure));
+    else memcpy(timing,line,sizeof(timing));
+    pthread_mutex_unlock(&mock_mutex);
 }
 static void b1_download_hop(void *opaque,int hop,int status,const char *host,uint64_t bytes)
 { (void)opaque;(void)hop;(void)status;(void)host;(void)bytes; }
@@ -39,16 +50,23 @@ static int rs_mock_download(int tmpl,const struct forever_download *d,const char
         assert(!ftruncate(fd,redist->size) && !close(fd));
         *total=*length=redist->size;return 0;
     }
-    calls++;
+    pthread_mutex_lock(&mock_mutex);
+    unsigned my_call=++calls;
+    if(++active>max_active) max_active=active;
+    pthread_mutex_unlock(&mock_mutex);
     assert(!strcmp(d->authority,"jagex.akamaized.net"));
     assert(!strcmp(d->path_prefix,"/direct6/launcher-win-x86_64/"));
-    if(fail_fetch && calls==(unsigned)fail_fetch) return EIO;
+    if(fail_fetch && my_call==(unsigned)fail_fetch) { pthread_mutex_lock(&mock_mutex);active--;pthread_mutex_unlock(&mock_mutex);return EIO; }
     char text[4096];const unsigned char *data=(const unsigned char *)text;size_t bytes;
     const char *id="0000000000000000000000000000000000000000000000000000000000000000";
     if(strstr(d->url,"alias.json")) {
         snprintf(text,sizeof(text),"{\"launcher-win-x86_64.production\":\"%s\"}",id);bytes=strlen(text);
     } else if(strstr(d->url,"catalog/")) {
         snprintf(text,sizeof(text),"{\"config\":{\"remote\":{\"baseUrl\":\"https://jagex.akamaized.net/direct6/launcher-win-x86_64/\",\"flags\":\"gzip\",\"type\":\"httpPiece\",\"pieceFormat\":\"pieces/{SubString:0,2,{TargetDigest}}/{TargetDigest}.solidpiece\"}},\"id\":\"%s\",\"metafile\":\"https://jagex.akamaized.net/direct6/launcher-win-x86_64/metafile/%s/metafile.json\"}",id,id);bytes=strlen(text);
+    } else if(strstr(d->url,"metafile/") && ordered) {
+        snprintf(text,sizeof(text),"{\"algorithm\":\"sha256\",\"id\":\"%s\",\"version\":\"3.0.0\",\"files\":[{\"attr\":0,\"name\":\"big\",\"size\":%u}],\"pieces\":{\"algorithm\":\"sha256\",\"hashPadding\":false,\"digests\":[",id,ORDERED_PIECES*3);
+        for(unsigned i=0;i<ORDERED_PIECES;i++) { strcat(text,i?",\"":"\"");strcat(text,ordered_b64[i]);strcat(text,"\""); }
+        strcat(text,"]}}");bytes=strlen(text);
     } else if(strstr(d->url,"metafile/")) {
         if(mixed_pieces) {
             /* Eighteen gzip pieces, then two stored pieces. Piece 19 crosses
@@ -61,19 +79,27 @@ static int rs_mock_download(int tmpl,const struct forever_download *d,const char
             snprintf(text,sizeof(text),"{\"algorithm\":\"sha256\",\"id\":\"%s\",\"version\":\"3.0.0\",\"files\":[{\"attr\":0,\"name\":\"a\",\"size\":1},{\"attr\":0,\"name\":\"dir/b\",\"size\":%d},{\"attr\":0,\"name\":\"empty\",\"size\":0}],\"pieces\":{\"algorithm\":\"sha256\",\"hashPadding\":false,\"digests\":[\"ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\"]}}",id,wrong_size?3:2);bytes=strlen(text);
         }
     } else {
-        if(mixed_pieces && calls>=22) {
-            assert(calls<=23);
-            const char *digest=calls==22?"cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34":"50ae61e841fac4e8f9e40baf2ad36ec868922ea48368c18f9535e47db56dd7fb";
-            assert(strstr(d->url,digest));
+        const char *stored_digest[2]={"cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34","50ae61e841fac4e8f9e40baf2ad36ec868922ea48368c18f9535e47db56dd7fb"};
+        int ordered_index=-1;
+        if(ordered) for(unsigned i=0;i<ORDERED_PIECES;i++) if(strstr(d->url,ordered_hex[i])) ordered_index=(int)i;
+        if(ordered) {
+            assert(ordered_index>=0);
+            /* Later pieces finish first: workers complete out of order. */
+            usleep((ORDERED_PIECES-(unsigned)ordered_index)*1500u);
+            memcpy(text,good,6);text[5]=0;memcpy(text+6,ordered_data[ordered_index],3);bytes=9;
+            if(ordered_index==ordered_corrupt) text[6]^=1;
+        } else if(mixed_pieces && (strstr(d->url,stored_digest[0]) || strstr(d->url,stored_digest[1]))) {
+            unsigned second=strstr(d->url,stored_digest[1])!=NULL;
             memcpy(text,good,6);text[5]=unknown_method?1:0;
-            memcpy(text+6,calls==22?"def":"ghi",3);bytes=9;
-            if(corrupt_stored) text[6]^=1;
+            memcpy(text+6,second?"ghi":"def",3);bytes=9;
+            if(corrupt_stored && !second) text[6]^=1;
         } else {
             assert(strstr(d->url,"pieces/ba/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad.solidpiece"));
             memcpy(text,good,sizeof(good));if(corrupt_piece) text[21]='d';bytes=sizeof(good);
         }
     }
     assert(bytes<=d->cap);FILE *file=fopen(d->destination,"wb");assert(file);
+    pthread_mutex_lock(&mock_mutex);active--;pthread_mutex_unlock(&mock_mutex);
     assert(fwrite(data,1,bytes,file)==bytes);assert(!fclose(file));*total=*length=bytes;return 0;
 }
 #define forever_https_open rs_mock_open
@@ -168,11 +194,55 @@ int main(void)
     unsigned char lengths[80];
     assert(!rs_read(RS_STAGE "/.ssn-lengths",lengths,sizeof(lengths),&bytes) && bytes==80);
     for(unsigned i=0;i<20;i++) assert(rs_le32(lengths+i*4)==3);
-    calls=0;corrupt_stored=1;assert(rs_install_native()==EINVAL && calls==22);
+    calls=0;corrupt_stored=1;assert(rs_install_native()==EINVAL && (calls==22 || calls==23));
     assert(strstr(failure,"step=verifying piece digest piece_index=18 file_index=1"));
     assert(strstr(failure,"wire=9 decoded=3 file_offset=53 total=54"));
-    calls=0;corrupt_stored=0;unknown_method=1;assert(rs_install_native()==EINVAL && calls==22);
+    calls=0;corrupt_stored=0;unknown_method=1;assert(rs_install_native()==EINVAL && (calls==22 || calls==23));
     assert(strstr(failure,"step=unpacking piece piece_index=18 file_index=1"));
+    unknown_method=0;mixed_pieces=0;
+    /* Concurrent fetch: 24 distinct stored pieces of one file, served so later
+     * pieces complete first. Output must still be in manifest order. */
+    static const char b64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for(unsigned i=0;i<ORDERED_PIECES;i++) {
+        ordered_data[i][0]='A'+i;ordered_data[i][1]='a'+i;ordered_data[i][2]='0'+(i%10);
+        struct sha256_context hash;unsigned char sum[32];sha256_init(&hash);sha256_update(&hash,ordered_data[i],3);sha256_final(&hash,sum);
+        for(unsigned n=0;n<32;n++) sprintf(ordered_hex[i]+n*2,"%02x",sum[n]);
+        unsigned o=0;
+        for(unsigned n=0;n<30;n+=3) {
+            unsigned v=(unsigned)sum[n]<<16|(unsigned)sum[n+1]<<8|sum[n+2];
+            for(int s=18;s>=0;s-=6) ordered_b64[i][o++]=b64[(v>>s)&63];
+        }
+        unsigned v=(unsigned)sum[30]<<16|(unsigned)sum[31]<<8;
+        ordered_b64[i][o++]=b64[(v>>18)&63];ordered_b64[i][o++]=b64[(v>>12)&63];ordered_b64[i][o++]=b64[(v>>6)&63];
+        ordered_b64[i][o++]='=';ordered_b64[i][o]=0;
+    }
+    ordered=1;calls=0;max_active=0;
+    assert(!rs_install_native() && calls==3+ORDERED_PIECES);
+    assert(max_active>1 && max_active<=RS_WORKERS); /* really parallel, window bounded */
+    unsigned char big[ORDERED_PIECES*3+1];
+    assert(!rs_read(RS_STAGE "/big",big,sizeof(big),&bytes) && bytes==ORDERED_PIECES*3);
+    for(unsigned i=0;i<ORDERED_PIECES;i++) assert(!memcmp(big+i*3,ordered_data[i],3));
+    unsigned char ordered_lengths[ORDERED_PIECES*4+1];
+    assert(!rs_read(RS_STAGE "/.ssn-lengths",ordered_lengths,sizeof(ordered_lengths),&bytes) && bytes==ORDERED_PIECES*4);
+    for(unsigned i=0;i<ORDERED_PIECES;i++) assert(rs_le32(ordered_lengths+i*4)==3);
+    assert(strstr(timing,"ssn timing total pieces=24/24 workers=5") && strstr(timing,"worker_ms[fetch="));
+    /* A corrupt piece in the middle, at the edges: abort at exactly that piece,
+     * every earlier piece already written in order, none after it. */
+    const int corrupt_at[]={0,11,23};
+    for(unsigned c=0;c<3;c++) {
+        char expect[160];
+        ordered_corrupt=corrupt_at[c];calls=0;
+        assert(rs_install_native()==EINVAL && calls<=3+ORDERED_PIECES);
+        snprintf(expect,sizeof(expect),"step=verifying piece digest piece_index=%d file_index=0",corrupt_at[c]);
+        assert(strstr(failure,expect));
+        snprintf(expect,sizeof(expect),"file_offset=%d total=%d",corrupt_at[c]*3,corrupt_at[c]*3);
+        assert(strstr(failure,expect));
+        assert(access(RS_STAGE "/.runescape-installed",F_OK));
+    }
+    /* A failed transfer mid-run aborts cleanly and reports the fetch step. */
+    ordered_corrupt=-1;fail_fetch=3+13;calls=0;
+    assert(rs_install_native()==EIO && strstr(failure,"step=fetching piece"));
+    fail_fetch=0;ordered=0;
     /* Removing a stage symlink unlinks the link, never its outside target. */
     assert(!mkdir("test-runescape-install-target",0700));
     int target=open("test-runescape-install-target/keep",O_WRONLY|O_CREAT|O_EXCL,0600);assert(target>=0);

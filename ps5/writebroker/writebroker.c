@@ -10,6 +10,7 @@
  * "writebroker: ". */
 #include <dirent.h>
 #include <errno.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
@@ -281,6 +282,27 @@ static int repair_entry_at(
     int parent, const char *name, unsigned depth, struct wb_permission_repair *repair);
 static int repair_scan_directory(
     int directory_fd, unsigned depth, int skip_handoff, struct wb_permission_repair *repair);
+/* Identity of the user-data root this broker's token was published in. The
+ * token lives only in memory and in WB_TOKEN_FILE; once the file is gone or
+ * different (the user wiped /data/runescape), no app can authenticate to this
+ * broker again, yet it still holds the port and refuses its replacement. It
+ * then exits by itself. The decision uses only local filesystem state, never
+ * anything a network peer sends: an unauthenticated peer can trigger a check
+ * but cannot make a broker with an intact token file exit. */
+#ifndef WB_BROKER_TOKEN_FILE
+#define WB_BROKER_TOKEN_FILE WB_TOKEN_FILE
+#endif
+#ifndef WB_BROKER_ROOT
+#define WB_BROKER_ROOT WB_USER_ROOT
+#endif
+#ifndef WB_ORPHAN_EXIT
+#define WB_ORPHAN_EXIT() exit(0)
+#endif
+#define WB_ORPHAN_TICK_MS 500
+static dev_t broker_root_device;
+static ino_t broker_root_inode;
+static int broker_root_known;
+static void broker_exit_if_orphaned(void);
 static int write_token(void);
 
 static int repair_open_data_root(dev_t *device)
@@ -469,6 +491,50 @@ failed:
     return result;
 }
 
+static int repair_handoff_directory(int parent, struct wb_permission_repair *repair)
+{
+    struct stat status;
+    int fd, result;
+
+    if (repair->scanned >= WB_REPAIR_MAX_ENTRIES)
+    {
+        repair->failed++;
+        if (!repair->result) repair->result = -E2BIG;
+        return -E2BIG;
+    }
+    repair->scanned++;
+    fd = openat(parent, "handoff", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
+    {
+        result = -errno;
+        if (result == -ELOOP || result == -ENOTDIR)
+        {
+            repair->skipped++;
+            return 0;
+        }
+        repair->failed++;
+        if (!repair->result) repair->result = result;
+        return result;
+    }
+    if (fstat(fd, &status))
+    {
+        result = -errno;
+        close(fd);
+        repair->failed++;
+        if (!repair->result) repair->result = result;
+        return result;
+    }
+    if (status.st_dev != repair->device)
+    {
+        repair->skipped++;
+        close(fd);
+        return 0;
+    }
+    result = repair_apply_mode(fd, &status, repair);
+    close(fd);
+    return result;
+}
+
 static int repair_scan_directory(
     int directory_fd, unsigned depth, int skip_handoff, struct wb_permission_repair *repair)
 {
@@ -506,8 +572,14 @@ static int repair_scan_directory(
         }
         if (skip_handoff && !strcmp(entry->d_name, "handoff"))
         {
-            repair->scanned++;
-            repair->skipped++;
+            /* The directory is shared (0777, FTP-deletable); the 0600 session
+             * files inside are never widened or scanned. */
+            child = repair_handoff_directory(directory_fd, repair);
+            if (child == -E2BIG)
+            {
+                result = child;
+                break;
+            }
             continue;
         }
         child = repair_entry_at(directory_fd, entry->d_name, depth + 1, repair);
@@ -543,9 +615,14 @@ static int repair_root(
     if (!strncmp(relative, private_root, sizeof(private_root) - 1) &&
         (!relative[sizeof(private_root) - 1] || relative[sizeof(private_root) - 1] == '/'))
     {
-        repair->scanned++;
-        repair->skipped++;
-        return 0;
+        /* Only the directory itself is repaired; session files stay 0600. */
+        if (relative[sizeof(private_root) - 1])
+        {
+            repair->scanned++;
+            repair->skipped++;
+            return 0;
+        }
+        recursive = 0;
     }
 #endif
     if (repair->scanned >= WB_REPAIR_MAX_ENTRIES)
@@ -1272,6 +1349,7 @@ static void *serve(void *arg)
     struct wb_reply reply = {.magic = WB_MAGIC};
     struct wb_write request;
     unsigned char *buffer = malloc(WB_BUFFER_SIZE);
+    int refused = 0;
 #ifdef WINE_PS5_RUNESCAPE
     wb_begin_allocation_session();
 #endif
@@ -1280,6 +1358,7 @@ static void *serve(void *arg)
         !hello.version || memcmp(hello.token, token, sizeof(token)))
     {
         say("connection refused (hello)");
+        refused = 1;
         goto done;
     }
     /* another version may only ask this broker to exit */
@@ -1329,6 +1408,7 @@ done:
 #ifdef WINE_PS5_RUNESCAPE
     wb_end_allocation_session();
 #endif
+    if (refused) broker_exit_if_orphaned();
     return NULL;
 }
 
@@ -1352,6 +1432,56 @@ static int write_token(void)
          ((status.st_mode & 07777) == mode || !fchmod(fd, mode));
     close(fd);
     return ok && !rename(temporary, name) ? 0 : -1;
+}
+
+/* Record the root's identity once the token for it is published. */
+static void broker_record_root(void)
+{
+    struct stat status;
+
+    broker_root_known = !stat(WB_BROKER_ROOT, &status) && S_ISDIR(status.st_mode);
+    if (!broker_root_known) return;
+    broker_root_device = status.st_dev;
+    broker_root_inode = status.st_ino;
+}
+
+/* Why no app can authenticate to this broker any more, or NULL while it can.
+ * Only definite evidence counts: a missing root or token file, a replaced root
+ * directory, or token-file content that is not this broker's token. An
+ * unexpected stat/open/read failure is not evidence and keeps the broker. */
+static const char *broker_orphaned(void)
+{
+    unsigned char disk[WB_TOKEN_BYTES + 1];
+    struct stat status;
+    ssize_t count;
+    int fd;
+
+    if (stat(WB_BROKER_ROOT, &status))
+        return errno == ENOENT || errno == ENOTDIR ? "user-data root is gone" : NULL;
+    if (broker_root_known &&
+        (status.st_dev != broker_root_device || status.st_ino != broker_root_inode))
+        return "user-data root was replaced";
+    if ((fd = open(WB_BROKER_TOKEN_FILE, O_RDONLY | O_CLOEXEC)) < 0)
+        return errno == ENOENT || errno == ENOTDIR ? "token file is gone" : NULL;
+    do count = read(fd, disk, sizeof(disk));
+    while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count < 0) return NULL;
+    if (count != (ssize_t)sizeof(token) || memcmp(disk, token, sizeof(token)))
+        return "token file no longer holds this broker's token";
+    return NULL;
+}
+
+/* Exit when orphaned so the title's start path can take the port. Called on
+ * every refused hello (a title whose token file is missing connects and hangs
+ * up without one) and on the idle tick. */
+static void broker_exit_if_orphaned(void)
+{
+    const char *reason = broker_orphaned();
+
+    if (!reason) return;
+    say("orphaned: %s; exiting so a new broker can take port %d", reason, WB_PORT);
+    WB_ORPHAN_EXIT();
 }
 
 /* ask a running broker to exit: it trusts whoever can read its token. An
@@ -1410,6 +1540,7 @@ int main(void)
         say("not started: cannot write %s errno=%d", WB_TOKEN_FILE, errno);
         return 1;
     }
+    broker_record_root();
     if (listen(listener, 64))
     {
         say("not started: listen errno=%d", errno);
@@ -1420,9 +1551,14 @@ int main(void)
         (unsigned)geteuid(), (unsigned)getegid());
     for (;;)
     {
-        int client = accept(listener, NULL, NULL);
+        struct pollfd ready = {.fd = listener, .events = POLLIN};
         struct timeval timeout = {.tv_sec = 30};
         pthread_t thread;
+        int client, waiting = poll(&ready, 1, WB_ORPHAN_TICK_MS);
+
+        if (waiting < 0) { if (errno == EINTR) continue; say("poll errno=%d", errno); break; }
+        if (!waiting) { broker_exit_if_orphaned(); continue; }
+        client = accept(listener, NULL, NULL);
 
         if (client < 0) { if (errno == EINTR) continue; say("accept errno=%d", errno); break; }
         /* an idle title connection may wait as long as it likes; a stuck reply may not */

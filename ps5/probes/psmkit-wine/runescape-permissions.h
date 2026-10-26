@@ -33,7 +33,7 @@ static void rs_permission_entry(char *path, size_t length, size_t capacity,
     int fd;
     mode_t wanted;
     report->scanned++;
-    if (wine_ps5_private_handoff_path(path)) { report->skipped++;return; }
+    int private_entry = wine_ps5_private_handoff_path(path);
     if (depth > 128) { rs_permission_error(report, ELOOP);return; }
     fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
@@ -52,12 +52,15 @@ static void rs_permission_entry(char *path, size_t length, size_t capacity,
         (S_ISREG(opened.st_mode) && opened.st_nlink > 1)) {
         report->skipped++;close(fd);return;
     }
+    /* Only the handoff directory itself is repaired (0777, FTP-deletable); its
+     * 0600 session files are never widened and nothing inside is scanned. */
+    if (private_entry && !S_ISDIR(opened.st_mode)) { report->skipped++;close(fd);return; }
     wanted = wine_ps5_shared_permissions(opened.st_mode);
     if ((opened.st_mode & 07777) != (wanted & 07777)) {
         if (fchmod(fd, wanted)) rs_permission_error(report, errno);
         else report->changed++;
     }
-    if (!S_ISDIR(opened.st_mode)) { close(fd);return; }
+    if (!S_ISDIR(opened.st_mode) || private_entry) { close(fd);return; }
     directory = opendir(path);
     if (!directory) { rs_permission_error(report, errno);close(fd);return; }
     /* Wine has not started yet. Reject detectable namespace replacement before

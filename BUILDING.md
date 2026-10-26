@@ -7,9 +7,12 @@ WGL/Zink and DXVK over RADV. Host build qualification is **not** Jagex/OSRS
 graphics, login or gameplay qualification. Jagex startup does not stage or start
 AddonForge, Battle.net or WoW.
 
-OSRS handoff uses `/data/runescape/handoff`: a private `0700` directory with
-exclusive `0600` one-shot requests, explicitly excluded from native/Wine shared
-creation modes and both startup repair walkers. Requests are deleted on
+OSRS handoff uses `/data/runescape/handoff`: a `0777` directory (so FTP can delete
+the whole `/data/runescape` tree; created that way and repaired at startup) with
+exclusive `0600` one-shot requests (others can delete them but not read them).
+Both startup repair walkers set the directory itself to `0777` like the rest of the
+data root, but never widen or scan the session files, which are also excluded from
+native/Wine shared creation modes. Requests are deleted on
 consumption, failed game LoadExec and stale-start cleanup. `/download0` is not
 used. Native cross-LoadExec persistence remains separate from host filesystem
 and codec tests. Automatic closure uses own-PID `sceKernelGetAppInfo` followed
@@ -104,11 +107,11 @@ These tests are host regressions, not evidence of Jagex/OSRS execution.
 From `SOURCE_ROOT/ps5-proton/ps5-runescape` on x86-64 Linux with Docker:
 
 ```sh
-JOBS=24 bash ps5/release/build-linux.sh /path/to/SOURCE_ROOT 01.000.021
+JOBS=24 bash ps5/release/build-linux.sh /path/to/SOURCE_ROOT 01.000.022
 ```
 
 The version must match `ps5/title/sce_sys/param.json` and is the release tag
-(`01.000.021` is the first public RuneScape prerelease).
+(`01.000.022` is the current public RuneScape prerelease).
 `.github/workflows/release.yml` fetches the pinned sources and runs this same
 build on a self-hosted Linux runner. To release, raise `contentVersion`, commit
 and push, then open Actions → Release → Run workflow and tick **publish**: the

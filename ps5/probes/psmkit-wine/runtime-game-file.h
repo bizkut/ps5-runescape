@@ -61,12 +61,19 @@ static inline int pw_game_handoff_path(const char *directory, const char *token,
     length = snprintf(path, 4096, "%s/%s", directory, token);
     return length < 0 || length >= 4096 ? ENAMETOOLONG : 0;
 }
-/* A nonnegative result is a held directory FD; errors are negative errno. */
+/* The handoff directory is 0777 so FTP and other apps can delete the whole
+ * /data/runescape tree. Secrets stay protected by the per-request files: they are
+ * created O_EXCL|O_NOFOLLOW with 0600 and must be a single regular file owned by
+ * the same uid as the directory, so others can delete but never read or plant one.
+ * Creation (startup) chmods an existing directory to 0777 when it can; the startup
+ * permission repair (writebroker / rs_repair_permissions) is the backup. Safety does
+ * not depend on the directory mode or owner (PS5 uid mapping is unreliable).
+ * A nonnegative result is a held directory FD; errors are negative errno. */
 static inline int pw_game_handoff_directory(const char *directory, int create, struct stat *status,
                                              struct pw_game_handoff_diagnostic *diagnostic)
 {
     int fd, error;
-    if (create && mkdir(directory, 0700) && errno != EEXIST)
+    if (create && mkdir(directory, 0777) && errno != EEXIST)
         return -pw_game_handoff_failure(diagnostic, "mkdir-directory", errno);
     fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (fd < 0) return -pw_game_handoff_failure(diagnostic, "open-directory", errno);
@@ -80,12 +87,10 @@ static inline int pw_game_handoff_directory(const char *directory, int create, s
     if (!S_ISDIR(status->st_mode)) {
         close(fd);return -pw_game_handoff_failure(diagnostic, "validate-directory-type", ENOTDIR);
     }
-    if ((status->st_mode & 07777) != 0700) {
-        if (!create) { close(fd);return -pw_game_handoff_failure(diagnostic, "validate-directory-mode", EACCES); }
-        if (fchmod(fd, 0700)) {
-            error = pw_game_handoff_failure(diagnostic, "chmod-directory", errno);close(fd);return -error;
-        }
-        status->st_mode = (status->st_mode & ~07777) | 0700;
+    /* Best effort: make an older 0700 directory 0777 now; the startup permission
+     * repair (broker backup) fixes it otherwise. Neither mode nor owner may fail prepare. */
+    if (create && (status->st_mode & 07777) != 0777 && !fchmod(fd, 0777)) {
+        status->st_mode = (status->st_mode & ~07777) | 0777;
         if (diagnostic) diagnostic->directory_mode = status->st_mode;
     }
     return fd;

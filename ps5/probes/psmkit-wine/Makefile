@@ -94,7 +94,7 @@ runtime-b1: $(HOST_OUT)/test-staged-runtime build-runtime.py runtime_profiles.py
 		forever-menu-settings.h forever-setup.h forever-fonts.h $(PREFIX_INIT_HEADER) sha256.h addon-worker-elf.h runtime-vulkan.c runtime-profile.h runtime-input.c \
 		protocol.c protocol.h title-log.c title-log.h $(TITLE_DESKTOP) $(TITLE_VOICE) \
 		forever-download.h runescape-vaprobe.h runescape-install.h runescape-ssn.h runescape-piece.h runescape-bootstrap.c \
-		runescape-redist.h runescape-permissions.h runescape-shared-io.h $(SHARED_MODE_HEADER) \
+		runescape-redist.h runescape-launcher-retry.h runescape-permissions.h runescape-shared-io.h $(SHARED_MODE_HEADER) \
 		runtime-game-profile.h $(SHARED_GAME_HEADER) \
 		../../addon-worker/third_party/miniz/miniz_tinfl.c \
 		../../addon-worker/third_party/miniz/miniz_tinfl.h ../../addon-worker/third_party/miniz/miniz_common.h \
@@ -156,6 +156,11 @@ test-native-wgl: test-native-wgl.py $(WINE_SRC)/dlls/gdi32/opengl.c \
 	python3 test-native-wgl.py --wine "$(WINE_SRC)" --out "$(HOST_OUT)" --cc "$(HOST_CC)"
 test-vulkan-attribution: test-vulkan-attribution.py runtime-vulkan.c $(WINE_SRC)/dlls/win32u/vulkan.c
 	python3 test-vulkan-attribution.py --wine "$(WINE_SRC)" --out "$(HOST_OUT)" --cc "$(HOST_CC)"
+
+.PHONY: test-combase-surrogate
+test: test-combase-surrogate
+test-combase-surrogate: test-combase-surrogate.py $(WINE_SRC)/dlls/combase/rpc.c
+	python3 test-combase-surrogate.py --wine "$(WINE_SRC)" --out "$(HOST_OUT)/combase-surrogate" --cc "$(HOST_CC)"
 
 .PHONY: test-title-viewport test-title-viewport-vulkan
 test: test-title-viewport
@@ -279,7 +284,7 @@ test: $(HOST_OUT)/test-protocol $(HOST_OUT)/test-protocol-runescape \
 		$(HOST_OUT)/test-direct-commit $(HOST_OUT)/test-direct-cache $(HOST_OUT)/test-direct-fail-fast $(HOST_OUT)/test-vm-cpu \
 		$(HOST_OUT)/test-direct-reserve $(HOST_OUT)/test-placeholder $(HOST_OUT)/test-runescape-vaprobe \
 		$(HOST_OUT)/test-runtime-input $(HOST_OUT)/test-padmap $(HOST_OUT)/test-maintenance-padmap $(HOST_OUT)/test-title-input \
-		$(HOST_OUT)/test-runescape-ssn $(HOST_OUT)/test-runescape-install $(HOST_OUT)/test-nsi-tcp \
+		$(HOST_OUT)/test-runescape-ssn $(HOST_OUT)/test-runescape-install $(HOST_OUT)/test-runescape-launcher-retry $(HOST_OUT)/test-nsi-tcp \
 		$(HOST_OUT)/test-title-ime $(HOST_OUT)/test-title-ime-delivery $(HOST_OUT)/test-title-ime-delivery-diag $(HOST_OUT)/test-title-voice \
 		$(HOST_OUT)/test-title-voice-overlay $(HOST_OUT)/test-title-voice-overlay-vulkan \
 		$(HOST_OUT)/test-runtime-relaunch $(HOST_OUT)/test-wow-channels \
@@ -321,6 +326,7 @@ test: $(HOST_OUT)/test-protocol $(HOST_OUT)/test-protocol-runescape \
 	$(HOST_OUT)/test-maintenance-padmap
 	$(HOST_OUT)/test-runescape-ssn
 	$(HOST_OUT)/test-runescape-install
+	$(HOST_OUT)/test-runescape-launcher-retry
 	$(HOST_OUT)/test-nsi-tcp
 	python3 test-runescape-bootstrap.py
 	$(HOST_OUT)/test-title-input
@@ -605,11 +611,15 @@ $(HOST_OUT)/test-runescape-ssn: test-runescape-ssn.c runescape-ssn.h
 	mkdir -p $(HOST_OUT)
 	$(HOST_CC) -std=gnu11 -O2 -g -Wall -Wextra -Werror $< -o $@
 
+$(HOST_OUT)/test-runescape-launcher-retry: test-runescape-launcher-retry.c runescape-launcher-retry.h
+	mkdir -p $(HOST_OUT)
+	$(HOST_CC) -std=gnu11 -O2 -g -Wall -Wextra -Werror $< -o $@
+
 $(HOST_OUT)/test-runescape-install: test-runescape-install.c runescape-piece.h runescape-ssn.h \
 		runescape-install.h runescape-redist.h forever-download.h sha256.h \
 		../../addon-worker/third_party/miniz/miniz_tinfl.c $(wildcard ../../addon-worker/third_party/miniz/*.h)
 	mkdir -p $(HOST_OUT)
-	$(HOST_CC) -std=gnu11 -O2 -g -Wall -Wextra -Werror $< ../../addon-worker/third_party/miniz/miniz_tinfl.c -o $@
+	$(HOST_CC) -std=gnu11 -O2 -g -Wall -Wextra -Werror -pthread $< ../../addon-worker/third_party/miniz/miniz_tinfl.c -o $@
 
 $(HOST_OUT)/test-title-input: test-title-input.c ../../title/input.c ../../title/input.h
 	mkdir -p $(HOST_OUT)

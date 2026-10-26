@@ -70,6 +70,10 @@ static int32_t sceKernelAvailableFlexibleMemorySize(size_t *free_bytes)
 { *free_bytes = ((size_t)1 << 30) - flexible; return 0; }
 static void ps5_direct_fail_fast(void) { assert(!"native reset must not fail"); }
 static void direct_log(const char *format, ...) { (void)format; }
+enum { PS5_FLEX_REPLACE, PS5_FLEX_FILEMAP, PS5_FLEX_ANON, PS5_FLEX_KINDS };
+static unsigned flex_notes;
+static void ps5_direct_flex_note(unsigned kind, void *base, size_t size)
+{ (void)base; assert(kind == PS5_FLEX_REPLACE && size); flex_notes++; }
 static int get_unix_prot(unsigned vprot) { return vprot & VPROT_COMMITTED ? PROT_READ | PROT_WRITE : PROT_NONE; }
 static void *anon_mmap_fixed(void *base, size_t size, int prot, int flags)
 {
@@ -141,8 +145,9 @@ int main(void)
     fail_mmap = 1;
     assert(replace_placeholder(&subset, subset->base, subset->size, VPROT_COMMITTED) == STATUS_NO_MEMORY);
     assert(subset->protect & VPROT_FREE_PLACEHOLDER); assert(!flexible);
-    fail_mmap = 0;
+    fail_mmap = 0; assert(!flex_notes);
     assert(!replace_placeholder(&subset, subset->base, subset->size, VPROT_COMMITTED));
+    assert(flex_notes == 1);
     assert(flexible == 2 * PAGE && !(subset->protect & VPROT_PS5_PLACEHOLDER));
     assert(pages[0] == 1 && pages[1] == 2 && pages[2] == 2 && pages[3] == 1);
     assert(!free_pages_preserve_placeholder(subset, subset->base, subset->size));

@@ -53,9 +53,10 @@ server_names = ('transfer', 'discard', 'menu_remove_index', 'menu_remove_path_al
                 'menu_open_child_directory', 'menu_open_prefix_root', 'menu_open_remove_parent',
                 'menu_remove_at', 'menu_remove_tree', 'serve_menu_remove', 'serve_write',
                 'repair_open_data_root', 'repair_open_relative_directory',
-                'repair_apply_mode', 'repair_scan_directory', 'repair_entry_at',
+                'repair_apply_mode', 'repair_handoff_directory', 'repair_scan_directory', 'repair_entry_at',
                 'repair_root', 'repair_all',
-                'broker_prepare_startup',
+                'broker_prepare_startup', 'broker_record_root', 'broker_orphaned',
+                'broker_exit_if_orphaned',
                 'read_whole', 'install_icon', 'serve_statfs', 'serve')
 client_names = ('bounce_acquire', 'bounce_release', 'broker_transfer', 'broker_connect',
                 'broker_get_connection', 'broker_query_fs', 'broker_request', 'broker_pwrite',

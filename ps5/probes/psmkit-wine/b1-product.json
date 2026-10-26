@@ -12,6 +12,6 @@
   "dns_upstreams": ["1.1.1.1", "8.8.8.8"],
   "environment": {"WINEPS5_VAPROBE": "0", "WINEPS5_CHUNKED_RESERVE": "1"},
   "browser_switches": {
-    "JagexLauncher.exe": ["--in-process-gpu", "--disable-gpu", "--disable-gpu-compositing", "--disable-software-rasterizer", "--enable-features=NetworkServiceInProcess2", "--disable-features=AudioServiceOutOfProcess", "--renderer-process-limit=1", "--enable-spatial-navigation"]
+    "JagexLauncher.exe": ["--in-process-gpu", "--disable-gpu", "--disable-gpu-compositing", "--disable-software-rasterizer", "--enable-features=NetworkServiceInProcess2", "--disable-features=AudioServiceOutOfProcess", "--renderer-process-limit=1", "--enable-low-end-device-mode", "--enable-spatial-navigation"]
   }
 }

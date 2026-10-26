@@ -34,7 +34,10 @@ Your data lives in **`/data/runescape`** (Wine prefix, launcher and game files,
 settings). It is separate from the app folder, so updating the app keeps it.
 This folder is deliberately world-readable and writable so FTP and other PS5
 apps can reach it; it contains launcher session data, so only run apps you trust
-and **never share it** or unreviewed logs/screenshots from it.
+and **never share it** or unreviewed logs/screenshots from it. The whole folder
+can be deleted over FTP. Its short-lived `handoff` subfolder (Play request
+files) is also open, but each file is readable only by the title; other apps can
+delete it but not read it.
 
 ## Controls
 
